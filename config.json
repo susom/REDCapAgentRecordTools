@@ -1,27 +1,26 @@
 {
-	"name": "ClassNameHere",
+	"name": "REDCapAgentRecordTools",
 
-	"namespace": "Stanford\\ClassNameHere",
+	"namespace": "Stanford\\REDCapAgentRecordTools",
 
-	"description": "A template for a REDCap External Module",
+	"description": "REDCapAgentRecordTools is a lightweight External Module that exposes record-related actions as callable agent tools for the SecureChatAI agent orchestration system.",
 
 	"documentation": "README.md",
 
 	"authors": [
 		{
-			"name": "Andrew Martin",
-			"email": "andy123@stanford.edu",
+			"name": "Irvin Szeto",
+			"email": "irvins@stanford.edu",
 			"institution": "Stanford University"
 		}
 	],
 
 	"permissions": [
-		"redcap_module_system_enable",
-		"redcap_module_project_enable",
-		"redcap_module_save_configuration"
+
 	],
 	
-	"enable-every-page-hooks-on-system-pages": false,	
+	"framework-version": 14,
+    "enable-every-page-hooks-on-system-pages": false,
 
 	"links": {
 		"project": [
@@ -32,9 +31,16 @@
 		]
 	},
 
-	"no-auth-pages": [
-
-	],
+	"api-actions": {
+		"records_getUserIdByFullName": {
+			"description": "Agent tool: resolve a REDCap record ID from a full name",
+			"access": ["auth"]
+		},
+		"records_getClinicalData": {
+			"description": "Agent tool: fetch clinical records for a REDCap record",
+			"access": ["auth"]
+		}
+	},
 
 	"project-settings": [
 		{
@@ -44,7 +50,6 @@
 			"type": "checkbox"
 		}
 	],
-
 
 	"system-settings": [
 		{

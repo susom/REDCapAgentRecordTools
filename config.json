@@ -32,12 +32,36 @@
 	},
 
 	"api-actions": {
-		"records_getUserIdByFullName": {
-			"description": "Agent tool: resolve a REDCap record ID from a full name",
+		"projects_getMetadata": {
+			"description": "Agent tool: get data dictionary (field definitions) for a project",
 			"access": ["auth"]
 		},
-		"records_getClinicalData": {
-			"description": "Agent tool: fetch clinical records for a REDCap record",
+		"projects_getInstruments": {
+			"description": "Agent tool: list all instruments/forms in a project",
+			"access": ["auth"]
+		},
+		"records_get": {
+			"description": "Agent tool: get specific record data by record ID",
+			"access": ["auth"]
+		},
+		"records_search": {
+			"description": "Agent tool: search records with optional REDCap logic filter",
+			"access": ["auth"]
+		},
+		"survey_getLink": {
+			"description": "Agent tool: generate survey link for a specific instrument and record",
+			"access": ["auth"]
+		},
+		"records_evaluateLogic": {
+			"description": "Agent tool: evaluate REDCap logic expression for a specific record",
+			"access": ["auth"]
+		},
+		"projects_search": {
+			"description": "Agent tool: search for projects by name/description (fuzzy match)",
+			"access": ["auth"]
+		},
+		"records_save": {
+			"description": "Agent tool: create or update record data",
 			"access": ["auth"]
 		}
 	},

@@ -66,6 +66,138 @@
 		}
 	},
 
+	"agent-tool-definitions": [
+		{
+			"name": "projects.search",
+			"description": "Search for REDCap projects by name, description, or project ID using fuzzy matching. Returns matching project IDs and titles.",
+			"api-action": "projects_search",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"query": {"type": "string", "description": "Search term — project name, description text, or numeric project ID"},
+					"limit": {"type": "integer", "description": "Maximum number of results to return", "default": 10}
+				},
+				"required": ["query"]
+			},
+			"readOnly": true,
+			"destructive": false
+		},
+		{
+			"name": "projects.getMetadata",
+			"description": "Get the data dictionary (field definitions) for a REDCap project. Returns field names, types, labels, validation, choices, and branching logic. Use this to understand a project's structure before reading or writing records.",
+			"api-action": "projects_getMetadata",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"pid": {"type": "integer", "description": "REDCap project ID"},
+					"fields": {"type": "array", "items": {"type": "string"}, "description": "Optional list of specific field names to retrieve. Omit to get all fields."}
+				},
+				"required": ["pid"]
+			},
+			"readOnly": true,
+			"destructive": false
+		},
+		{
+			"name": "projects.getInstruments",
+			"description": "List all instruments (forms) in a REDCap project. Returns instrument machine names and human-readable labels.",
+			"api-action": "projects_getInstruments",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"pid": {"type": "integer", "description": "REDCap project ID"}
+				},
+				"required": ["pid"]
+			},
+			"readOnly": true,
+			"destructive": false
+		},
+		{
+			"name": "records.get",
+			"description": "Retrieve data for a specific record by its record ID. Optionally filter to specific fields or events (for longitudinal projects).",
+			"api-action": "records_get",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"pid": {"type": "integer", "description": "REDCap project ID"},
+					"record_id": {"type": "string", "description": "The record ID to retrieve"},
+					"fields": {"type": "array", "items": {"type": "string"}, "description": "Optional list of specific field names to retrieve"},
+					"events": {"type": "array", "items": {"type": "string"}, "description": "Optional list of event names (for longitudinal projects only)"}
+				},
+				"required": ["pid", "record_id"]
+			},
+			"readOnly": true,
+			"destructive": false
+		},
+		{
+			"name": "records.search",
+			"description": "Search records in a REDCap project with an optional REDCap logic filter expression. Returns matching records and their data. Use REDCap logic syntax for filters, e.g. '[age] > 18' or '[status] = \"1\"'.",
+			"api-action": "records_search",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"pid": {"type": "integer", "description": "REDCap project ID"},
+					"filter": {"type": "string", "description": "REDCap logic filter expression, e.g. '[field_name] > 18'. Omit to return all records."},
+					"fields": {"type": "array", "items": {"type": "string"}, "description": "Optional list of specific field names to include in results"},
+					"return_format": {"type": "string", "enum": ["array", "json"], "description": "Response format", "default": "array"}
+				},
+				"required": ["pid"]
+			},
+			"readOnly": true,
+			"destructive": false
+		},
+		{
+			"name": "records.evaluateLogic",
+			"description": "Evaluate a REDCap logic expression against a specific record. Returns true or false. Useful for checking eligibility criteria or branching conditions.",
+			"api-action": "records_evaluateLogic",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"pid": {"type": "integer", "description": "REDCap project ID"},
+					"record_id": {"type": "string", "description": "The record ID to evaluate against"},
+					"logic": {"type": "string", "description": "REDCap logic expression to evaluate, e.g. '[age] >= 18 and [consent] = \"1\"'"},
+					"event": {"type": "string", "description": "Event name (optional, for longitudinal projects only)"}
+				},
+				"required": ["pid", "record_id", "logic"]
+			},
+			"readOnly": true,
+			"destructive": false
+		},
+		{
+			"name": "survey.getLink",
+			"description": "Generate a survey link URL for a specific instrument and record. The instrument must be enabled as a survey in the project.",
+			"api-action": "survey_getLink",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"pid": {"type": "integer", "description": "REDCap project ID"},
+					"record_id": {"type": "string", "description": "The record ID to generate the survey link for"},
+					"instrument": {"type": "string", "description": "The instrument machine name (must be survey-enabled)"},
+					"event": {"type": "string", "description": "Event name (optional, for longitudinal projects only)"},
+					"instance": {"type": "integer", "description": "Repeating instrument instance number", "default": 1}
+				},
+				"required": ["pid", "record_id", "instrument"]
+			},
+			"readOnly": true,
+			"destructive": false
+		},
+		{
+			"name": "records.save",
+			"description": "Create a new record or update an existing record in a REDCap project. The data object must include the record ID field. Use projects.getMetadata first to learn the field names and types before saving.",
+			"api-action": "records_save",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"pid": {"type": "integer", "description": "REDCap project ID"},
+					"data": {"type": "object", "description": "Record data object with field_name: value pairs. Must include the record ID field (typically 'record_id')."},
+					"overwrite": {"type": "boolean", "description": "If true, overwrite existing values. If false (default), only save to empty fields.", "default": false}
+				},
+				"required": ["pid", "data"]
+			},
+			"readOnly": false,
+			"destructive": true
+		}
+	],
+
 	"project-settings": [
 		{
 			"key": "enable-project-debug-logging",

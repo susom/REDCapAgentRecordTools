@@ -1,182 +1,163 @@
 # REDCapAgentRecordTools
 
-REDCapAgentRecordTools is a lightweight External Module that exposes
-**project and record operations as callable agent tools** for the SecureChatAI
-agent orchestration system.
+A REDCap External Module that exposes **project and record operations as callable agent tools** for the [SecureChatAI](https://github.com/susom/secureChatAI) orchestration system.
 
-It exists solely to provide **atomic, auditable operations** that can be invoked
-by an LLM via SecureChatAI, enabling conversational CRUD workflows that
-**dynamically adapt to any REDCap project structure**.
+The module provides **atomic, auditable operations** invoked by an LLM — it is a pure data layer with no UI, no orchestration logic, and no LLM calls of its own.
 
 ---
 
-## Purpose
+## Table of Contents
 
-This module enables agentic workflows such as:
-
-- **Project Discovery**: Finding projects by fuzzy name search
-- **Dynamic Introspection**: Learning any project's field structure at runtime
-- **Flexible Querying**: Searching and filtering records with REDCap logic
-- **Status Checking**: Evaluating completion, eligibility, and complex conditions
-- **Data Operations**: Creating and updating records conversationally
-- **Workflow Automation**: Generating survey links for multi-step processes
-
-### Key Insight: Project-Agnostic Design
-
-The agent **does not need to know project structures in advance**. It discovers them dynamically:
-
-1. User: "Check my intake status for the Cancer study"
-2. Agent: `projects.search("Cancer")` → Finds "Oncology Patient Intake" (PID 42)
-3. Agent: `projects.getMetadata(pid=42)` → Learns the project has fields like `consent_date`, `enrollment_complete`
-4. Agent: `records.get(pid=42, record_id="user_123")` → Checks user's data
-5. Agent: Responds intelligently based on discovered structure
-
-**This works for ANY REDCap project** - research studies, clinical registries, administrative workflows, etc.
-
----
-
-## Example Agent Workflows
-
-### Workflow 1: Multi-Step Intake Progress
-
-> **User:** "For the PTSD study intake, what's my next step?"
->
-> **Agent:**
-> 1. `projects.search(query="PTSD study")` → Find project (PID 42)
-> 2. `projects.getInstruments(pid=42)` → Get list of intake forms
-> 3. `records.get(pid=42, record_id="1001")` → Check `*_complete` fields
-> 4. `survey.getLink(pid=42, record_id="1001", instrument="contact_info")` → Generate next survey URL
->
-> **Response:** "You've completed 4/6 intake forms (demographics, medical history, consent, baseline assessment). Next up: Contact Information. [Here's your survey link]"
-
-### Workflow 2: Cohort Queries
-
-> **User:** "How many participants completed baseline but not 6-month followup?"
->
-> **Agent:**
-> 1. `projects.getMetadata(pid=42)` → Understand field structure
-> 2. `records.search(pid=42, filter="[baseline_complete] = '2' AND [followup_6m_complete] <> '2'")` → Query matching records
->
-> **Response:** "23 participants have completed baseline but not 6-month followup."
-
-### Workflow 3: Data Updates
-
-> **User:** "Mark my consent form as complete"
->
-> **Agent:**
-> 1. `projects.search(query="intake")` → Find intake project
-> 2. `projects.getMetadata(pid=30)` → Learn field names
-> 3. `records.get(pid=30, record_id="irvins")` → Get current status
-> 4. `records.save(pid=30, data={record_id:"irvins", consent_complete:"2"}, overwrite=true)` → Update
->
-> **Response:** "Done! Your consent form is marked complete."
-
-### Workflow 4: Complex Status Analysis
-
-> **User:** "Tell me about intake #24 in the Rover project"
->
-> **Agent:**
-> 1. `projects.search(query="Rover")` → Find "Rover Intake" (PID 63)
-> 2. `projects.getMetadata(pid=63)` → Learn 273 fields, 147 required, 65 file uploads
-> 3. `records.get(pid=63, record_id="irvins")` → Retrieve record with repeating instruments
-> 4. Analyze instance 5 (intake_id=24)
->
-> **Response:** "Intake #24 is marked complete, but all required fields are empty and no files uploaded. This suggests validation may be disabled or it's a placeholder record."
+- [How It Works](#how-it-works)
+- [Installation & Setup](#installation--setup)
+- [Tool Reference](#tool-reference)
+  - [projects.search](#projectssearch)
+  - [projects.getMetadata](#projectsgetmetadata)
+  - [projects.getInstruments](#projectsgetinstruments)
+  - [records.get](#recordsget)
+  - [records.search](#recordssearch)
+  - [records.evaluateLogic](#recordsevaluatelogic)
+  - [records.save](#recordssave)
+  - [survey.getLink](#surveygetlink)
+- [Example Agent Workflows](#example-agent-workflows)
+- [How to Build Your Own Tool EM](#how-to-build-your-own-tool-em)
+  - [Step 1: Create config.json](#step-1-create-configjson)
+  - [Step 2: Implement the PHP Method](#step-2-implement-the-php-method)
+  - [Step 3: Wire It Up in the Router](#step-3-wire-it-up-in-the-router)
+  - [Step 4: Test It](#step-4-test-it)
+  - [Full Walkthrough: Adding a New Tool to This Module](#full-walkthrough-adding-a-new-tool-to-this-module)
+- [Architecture & Design Principles](#architecture--design-principles)
+- [Security Model](#security-model)
+- [Supported REDCap Features](#supported-redcap-features)
 
 ---
 
-## Quick Reference: All 8 Tools
+## How It Works
 
-| Tool | Purpose | Key Use Case |
-|------|---------|--------------|
-| **projects.search** | Find projects by name | User: "Check the Cancer study" |
-| **projects.getMetadata** | Learn field structure | Discover what fields exist before querying |
-| **projects.getInstruments** | List forms/surveys | "What forms are in this project?" |
-| **records.get** | Retrieve specific record | Get all data for record "1001" |
-| **records.search** | Query records with filters | Find all participants where `[age] > 18` |
-| **records.evaluateLogic** | Check eligibility/status | Is record "1001" eligible? (true/false) |
-| **records.save** | Create/update records | Mark consent form complete |
-| **survey.getLink** | Generate survey URLs | "Send me the intake survey link" |
-
----
-
-## Architecture Role
-
-| Component | Responsibility |
-|---------|----------------|
-| Chatbot EM (Cappy) | UI only |
-| SecureChatAI EM | Agent routing & orchestration |
-| **REDCapAgentRecordTools** | Atomic record operations |
-| LLM | Planner, not executor |
-
----
-
-## Exposed Tools (8 Total)
-
-### Project Discovery
-
-#### projects.search
-
-**Description**
-Search for REDCap projects by name, description, or PID. Uses fuzzy matching to find projects across the entire REDCap instance. Returns all projects (no user filtering) - governance layer to be added later.
-
-**Parameters**
-```json
-{
-  "query": "Cancer study",
-  "limit": 10  // optional: max results (default: 10)
-}
+```
+User → Cappy (or other UX) → SecureChatAI (Agent Orchestrator) → THIS MODULE → REDCap
 ```
 
-**Returns**
+1. User asks something in natural language ("What's my intake status for the Cancer study?")
+2. The calling EM (Cappy, MSPA, or any EM) calls `$secureChatAI->callAI()` with `agent_mode => true`
+3. SecureChatAI's LLM decides which tool(s) to call and with what parameters
+4. SecureChatAI invokes this module's `redcap_module_api()` internally (no API token needed)
+5. This module executes the corresponding REDCap operation and returns structured JSON
+6. The LLM uses the result to compose a human-readable response
+
+**The key design insight:** The agent doesn't need to know project structures in advance. It discovers them dynamically using `projects.search` → `projects.getMetadata` → then operates on whatever it finds. This makes the same 8 tools work across **any** REDCap project.
+
+---
+
+## Installation & Setup
+
+1. Place this module in your REDCap `modules/` directory (or `modules-local/` for development)
+2. Enable the module **system-wide** in REDCap's External Module Manager (project-level enablement is not required — SecureChatAI only needs the EM enabled at the system level to call it)
+3. In **SecureChatAI** settings, add this module's prefix to **Agent Tool EM Prefixes**:
+   - System-wide: `agent_tool_em_prefixes` setting
+   - Or per-project: `project_agent_tool_em_prefixes` setting (overrides system)
+
+That's it. SecureChatAI auto-discovers the tools from this module's config.json and invokes them via direct PHP calls (EM-to-EM). No API token, no HTTP requests, no network — just one EM calling another's `redcap_module_api()` method in the same process.
+
+### Calling from another EM
+
+Any EM can trigger an agent workflow by calling SecureChatAI directly:
+
+```php
+$secureChatAI = \ExternalModules\ExternalModules::getModuleInstance('secure_chat_ai');
+$response = $secureChatAI->callAI('gpt-4.1', [
+    'messages' => [
+        ['role' => 'system', 'content' => 'Your system prompt here'],
+        ['role' => 'user',   'content' => $userInput],
+    ],
+    'agent_mode' => true,
+], $project_id);
+```
+
+SecureChatAI handles tool discovery, LLM routing, and the agent loop. Your EM just sends the prompt.
+
+### External access (optional)
+
+If you need to call tools from **outside** REDCap (external services, curl, testing), you can use the REDCap API with an API token:
+
+```bash
+curl -X POST https://your-redcap-instance/api/ \
+  -d "token=YOUR_API_TOKEN" \
+  -d "content=externalModule" \
+  -d "prefix=redcap_agent_record_tools" \
+  -d "action=projects_search" \
+  -d 'payload={"query":"test"}'
+```
+
+This requires an API token for a project where the EM is enabled. For normal agent workflows within REDCap, this is unnecessary.
+
+---
+
+## Tool Reference
+
+Every tool is called via the REDCap External Module API. The request always looks like:
+
+```
+POST /api/
+  token=<API_TOKEN>
+  content=externalModule
+  prefix=redcap_agent_record_tools
+  action=<ACTION_NAME>
+  payload=<JSON_STRING>
+```
+
+All tools return JSON. On success, you get the result object. On failure, you get:
 ```json
+{"error": true, "message": "What went wrong"}
+```
+
+### projects.search
+
+**Action:** `projects_search`
+
+Search for REDCap projects by name, description, or PID. Uses fuzzy matching.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `query` | string | ✅ | Search term — name, description, or numeric PID |
+| `limit` | integer | | Max results (default: 10) |
+
+```json
+// Request
+{"query": "Cancer study", "limit": 5}
+
+// Response
 {
   "query": "Cancer study",
   "project_count": 2,
   "projects": [
-    {
-      "pid": 42,
-      "title": "Oncology Patient Intake",
-      "purpose": null,
-      "creation_time": "2025-06-18 10:40:29"
-    },
-    {
-      "pid": 55,
-      "title": "Cancer Registry",
-      "purpose": null,
-      "creation_time": "2024-03-12 08:15:00"
-    }
+    {"pid": 42, "title": "Oncology Patient Intake", "purpose": null, "creation_time": "2025-06-18 10:40:29"},
+    {"pid": 55, "title": "Cancer Registry", "purpose": null, "creation_time": "2024-03-12 08:15:00"}
   ]
 }
 ```
 
-**Use Cases:**
-- User mentions a project by name (e.g., "the PTSD study")
-- Agent needs to discover which PID to operate on
-- Searching by numeric PID (e.g., "project 63")
-
 ---
 
-### Project Introspection
+### projects.getMetadata
 
-#### projects.getMetadata
+**Action:** `projects_getMetadata`
 
-**Description**
-Get the data dictionary (field definitions) for a REDCap project. Returns field names, types, labels, validation rules, and branching logic.
+Get the data dictionary (field definitions) for a project — field names, types, labels, validation rules, branching logic.
 
-**Parameters**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `pid` | integer | ✅ | REDCap project ID |
+| `fields` | string[] | | Specific fields only (omit for all) |
+
 ```json
+// Request
+{"pid": 42, "fields": ["age", "consent_date"]}
+
+// Response
 {
   "pid": 42,
-  "fields": ["age", "consent"] // optional: specific fields only
-}
-```
-
-**Returns**
-```json
-{
-  "pid": 42,
-  "field_count": 45,
+  "field_count": 2,
   "fields": [
     {
       "field_name": "age",
@@ -193,117 +174,111 @@ Get the data dictionary (field definitions) for a REDCap project. Returns field 
 
 ---
 
-#### projects.getInstruments
+### projects.getInstruments
 
-**Description**
-List all instruments (forms/surveys) in a REDCap project.
+**Action:** `projects_getInstruments`
 
-**Parameters**
+List all instruments (forms/surveys) in a project.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `pid` | integer | ✅ | REDCap project ID |
+
 ```json
-{
-  "pid": 42
-}
-```
+// Request
+{"pid": 42}
 
-**Returns**
-```json
+// Response
 {
   "pid": 42,
   "instrument_count": 6,
   "instruments": [
-    {
-      "instrument_name": "demographics",
-      "instrument_label": "Demographics"
-    },
-    {
-      "instrument_name": "consent",
-      "instrument_label": "Consent Form"
-    }
+    {"instrument_name": "demographics", "instrument_label": "Demographics"},
+    {"instrument_name": "consent", "instrument_label": "Consent Form"}
   ]
 }
 ```
 
 ---
 
-### Record Operations (Read)
+### records.get
 
-#### records.get
+**Action:** `records_get`
 
-**Description**
-Retrieve a specific record's data by record ID.
+Retrieve a specific record by its record ID.
 
-**Parameters**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `pid` | integer | ✅ | REDCap project ID |
+| `record_id` | string | ✅ | The record ID to retrieve |
+| `fields` | string[] | | Specific fields only |
+| `events` | string[] | | Event names (longitudinal projects only) |
+
 ```json
-{
-  "pid": 42,
-  "record_id": "1001",
-  "fields": ["age", "consent_complete"], // optional
-  "events": ["baseline_arm_1"] // optional (for longitudinal projects)
-}
-```
+// Request
+{"pid": 42, "record_id": "1001", "fields": ["age", "consent_complete"]}
 
-**Returns**
-```json
+// Response
 {
   "pid": 42,
   "record_id": "1001",
   "data": {
-    "1001": {
-      "age": "34",
-      "consent_complete": "2"
-    }
+    "1001": {"age": "34", "consent_complete": "2"}
   }
 }
 ```
 
 ---
 
-#### records.search
+### records.search
 
-**Description**
-Search for records matching criteria. Use REDCap logic syntax for filters (e.g., `"[age] > 18 AND [consent] = '1'"`).
+**Action:** `records_search`
 
-**Parameters**
+Search records with an optional REDCap logic filter expression.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `pid` | integer | ✅ | REDCap project ID |
+| `filter` | string | | REDCap logic expression, e.g. `[age] > 18` |
+| `fields` | string[] | | Fields to include in results |
+| `return_format` | string | | `"array"` (default) or `"json"` |
+
 ```json
-{
-  "pid": 42,
-  "filter": "[baseline_complete] = '2' AND [age] >= 18",
-  "fields": ["record_id", "age", "baseline_complete"] // optional
-}
-```
+// Request
+{"pid": 42, "filter": "[baseline_complete] = '2' AND [age] >= 18"}
 
-**Returns**
-```json
+// Response
 {
   "pid": 42,
   "filter": "[baseline_complete] = '2' AND [age] >= 18",
   "record_count": 23,
   "records": {
-    "1001": { "age": "34", "baseline_complete": "2" },
-    "1002": { "age": "28", "baseline_complete": "2" }
+    "1001": {"age": "34", "baseline_complete": "2"},
+    "1002": {"age": "28", "baseline_complete": "2"}
   }
 }
 ```
 
 ---
 
-#### records.evaluateLogic
+### records.evaluateLogic
 
-**Description**
-Evaluate a REDCap logic expression for a specific record. Useful for checking eligibility, completion status, or complex conditions. Returns true/false.
+**Action:** `records_evaluateLogic`
 
-**Parameters**
+Evaluate a REDCap logic expression against a specific record. Returns `true`/`false`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `pid` | integer | ✅ | REDCap project ID |
+| `record_id` | string | ✅ | Record to evaluate against |
+| `logic` | string | ✅ | REDCap logic expression |
+| `event` | string | | Event name (longitudinal projects only) |
+
 ```json
-{
-  "pid": 42,
-  "record_id": "1001",
-  "logic": "[consent_complete] = '2' AND [age] >= 18",
-  "event": "baseline_arm_1" // optional (for longitudinal projects)
-}
-```
+// Request
+{"pid": 42, "record_id": "1001", "logic": "[consent_complete] = '2' AND [age] >= 18"}
 
-**Returns**
-```json
+// Response
 {
   "pid": 42,
   "record_id": "1001",
@@ -315,26 +290,79 @@ Evaluate a REDCap logic expression for a specific record. Useful for checking el
 
 ---
 
-### Survey Workflows
+### records.save
 
-#### survey.getLink
+**Action:** `records_save`
 
-**Description**
-Generate a survey URL for a specific instrument and record. The instrument must be enabled as a survey.
+Create or update record data.
 
-**Parameters**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `pid` | integer | ✅ | REDCap project ID |
+| `data` | object | ✅ | Field-value pairs (must include record ID field) |
+| `overwrite` | boolean | | `true` = overwrite existing values; `false` (default) = only write to empty fields |
+
 ```json
+// Request — simple update
 {
   "pid": 42,
-  "record_id": "1001",
-  "instrument": "consent",
-  "event": "baseline_arm_1", // optional (for longitudinal projects)
-  "instance": 1 // optional (for repeating instruments)
+  "data": {"record_id": "1001", "consent_date": "2026-01-22", "enrollment_complete": "2"},
+  "overwrite": true
+}
+
+// Request — repeating instrument
+{
+  "pid": 63,
+  "data": {
+    "record_id": "irvins",
+    "redcap_repeat_instrument": "user_info",
+    "redcap_repeat_instance": 7,
+    "intake_id": "42"
+  },
+  "overwrite": false
+}
+
+// Response (success)
+{
+  "pid": 42,
+  "success": true,
+  "records_saved": 1,
+  "record_ids": ["1001"],
+  "warnings": [],
+  "overwrite_mode": true
+}
+
+// Response (error)
+{
+  "error": true,
+  "message": "Failed to save data",
+  "errors": ["Field 'age' has invalid value 'abc' (must be integer)"],
+  "warnings": [],
+  "data_submitted": [{"record_id": "1001", "age": "abc"}]
 }
 ```
 
-**Returns**
+---
+
+### survey.getLink
+
+**Action:** `survey_getLink`
+
+Generate a survey URL. The instrument must be survey-enabled in the project.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `pid` | integer | ✅ | REDCap project ID |
+| `record_id` | string | ✅ | Record ID |
+| `instrument` | string | ✅ | Instrument machine name |
+| `event` | string | | Event name (longitudinal projects only) |
+| `instance` | integer | | Repeating instrument instance (default: 1) |
+
 ```json
+// Request
+{"pid": 42, "record_id": "1001", "instrument": "consent"}
+
+// Response
 {
   "pid": 42,
   "record_id": "1001",
@@ -345,210 +373,386 @@ Generate a survey URL for a specific instrument and record. The instrument must 
 
 ---
 
-### Record Operations (Write)
+## Example Agent Workflows
 
-#### records.save
+### Multi-Step Intake Progress
 
-**Description**
-Create new records or update existing records. Uses REDCap's saveData API with validation. Supports single records or batch operations. Returns detailed error messages if validation fails.
+> **User:** "For the PTSD study intake, what's my next step?"
+>
+> 1. `projects.search(query="PTSD study")` → Find project (PID 42)
+> 2. `projects.getInstruments(pid=42)` → Get list of intake forms
+> 3. `records.get(pid=42, record_id="1001")` → Check `*_complete` fields
+> 4. `survey.getLink(pid=42, record_id="1001", instrument="contact_info")` → Generate next survey URL
+>
+> **Agent:** "You've completed 4/6 intake forms. Next up: Contact Information. [Here's your survey link]"
 
-**Parameters**
+### Cohort Query
+
+> **User:** "How many participants completed baseline but not 6-month followup?"
+>
+> 1. `projects.getMetadata(pid=42)` → Understand field structure
+> 2. `records.search(pid=42, filter="[baseline_complete] = '2' AND [followup_6m_complete] <> '2'")` → Query
+>
+> **Agent:** "23 participants have completed baseline but not 6-month followup."
+
+### Data Update
+
+> **User:** "Mark my consent form as complete"
+>
+> 1. `projects.search(query="intake")` → Find project
+> 2. `projects.getMetadata(pid=30)` → Learn field names
+> 3. `records.save(pid=30, data={record_id:"irvins", consent_complete:"2"}, overwrite=true)` → Update
+>
+> **Agent:** "Done! Your consent form is marked complete."
+
+---
+
+## How to Build Your Own Tool EM
+
+This section explains how to create a new External Module that exposes tools to SecureChatAI, **or** how to add more tools to this module. The config.json structure is the tricky part, so we'll go through it carefully.
+
+> **Starter template available:** See [`redcap_agent_template`](https://github.com/susom/REDCapAgentTemplate) for a minimal, copy-and-go template EM with all the boilerplate already wired up.
+
+### Auto-Discovery via Naming Convention
+
+SecureChatAI discovers tool EMs by **prefix matching**. Any enabled EM whose prefix starts with `redcap_agent_` is scanned for `agent-tool-definitions` in its config.json.
+
+**To make your tool EM auto-discoverable:**
+1. Name your module directory `redcap_agent_<something>_v9.9.9`
+2. Include `agent-tool-definitions` in your config.json
+3. Enable the EM in REDCap
+
+SecureChatAI's EM settings control which prefix to scan (e.g., `redcap_agent_`). This gives you plug-and-play discovery with a namespace gate — new tool EMs are picked up automatically, but only if they follow the naming convention.
+
+### The Big Picture
+
+A tool EM has three pieces that must stay in sync:
+
+```
+config.json                         PHP Class
+┌─────────────────────┐            ┌──────────────────────┐
+│ "api-actions": {    │ ───maps──→ │ redcap_module_api()  │
+│   "my_action": {}   │            │   case "my_action":  │
+│ }                   │            │     return toolX()   │
+│                     │            └──────────────────────┘
+│ "agent-tool-        │
+│  definitions": [{   │ ───tells LLM──→ what tools exist
+│   "name": "x.y",   │                  and how to call them
+│   "api-action":     │
+│     "my_action"     │
+│ }]                  │
+└─────────────────────┘
+```
+
+- **`api-actions`** — Registers URL endpoints with REDCap's EM framework. This is what makes `/api/?action=my_action` work.
+- **`agent-tool-definitions`** — Describes each tool in JSON Schema format so the LLM knows how to call it. The `api-action` field links back to the corresponding `api-actions` entry.
+- **PHP switch case** — Routes the action string to the method that does the work.
+
+### Step 1: Create config.json
+
+The minimum config for a tool EM:
+
 ```json
 {
-  "pid": 42,
-  "data": {
-    "record_id": "1001",
-    "consent_date": "2026-01-22",
-    "enrollment_complete": "2"
+  "name": "MyAgentTools",
+  "namespace": "Stanford\\MyAgentTools",
+  "description": "Agent tools for doing X",
+  "framework-version": 14,
+
+  "api-actions": {
+    "my_action_name": {
+      "description": "What this endpoint does",
+      "access": ["auth"]
+    }
   },
-  "overwrite": true  // optional: true to update, false to create (default: false)
+
+  "agent-tool-definitions": [
+    {
+      "name": "category.toolName",
+      "description": "A clear description the LLM will read to decide when to use this tool",
+      "api-action": "my_action_name",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "param1": {
+            "type": "string",
+            "description": "What this parameter is for"
+          },
+          "param2": {
+            "type": "integer",
+            "description": "Optional numeric param",
+            "default": 10
+          }
+        },
+        "required": ["param1"]
+      },
+      "readOnly": true,
+      "destructive": false
+    }
+  ]
 }
 ```
 
-**For Repeating Instruments:**
+#### `api-actions` — explained
+
+```json
+"api-actions": {
+  "my_action_name": {         // ← This string is passed as $action to redcap_module_api()
+    "description": "...",     // ← Human-readable, for documentation
+    "access": ["auth"]        // ← Requires API authentication
+  }
+}
+```
+
+- The **key** (`my_action_name`) becomes the `action` parameter in API calls
+- Convention: use `snake_case` with a category prefix — `records_get`, `projects_search`, `files_upload`
+- Always use `"access": ["auth"]` so calls require a valid API token
+
+#### `agent-tool-definitions` — explained
+
+This is the part the **LLM reads** to decide what tools are available and how to call them. Each entry follows JSON Schema:
+
 ```json
 {
-  "pid": 63,
-  "data": {
-    "record_id": "irvins",
-    "redcap_repeat_instrument": "user_info",
-    "redcap_repeat_instance": 7,
-    "intake_id": "42",
-    "research_title": "New Study",
-    "user_info_complete": "2"
+  "name": "records.get",              // LLM-facing name (dot notation)
+  "description": "...",               // LLM reads this to decide when to use the tool
+  "api-action": "records_get",        // Must match a key in api-actions
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "pid": {
+        "type": "integer",            // JSON Schema types: string, integer, number, boolean, array, object
+        "description": "..."          // LLM reads this to know what value to pass
+      },
+      "fields": {
+        "type": "array",
+        "items": {"type": "string"},  // Array of strings
+        "description": "..."
+      }
+    },
+    "required": ["pid"]               // Which params the LLM must always provide
   },
-  "overwrite": false
+  "readOnly": true,                   // Hint: this tool only reads data
+  "destructive": false                // Hint: this tool won't delete anything
 }
 ```
 
-**Returns**
+**Tips for good tool definitions:**
+- The `description` is the most important field — a vague description means the LLM won't know when to pick the tool
+- Include examples in descriptions when the format isn't obvious (e.g., REDCap logic syntax)
+- Mark `readOnly: false` and `destructive: true` for tools that modify data (like `records.save`)
+- Keep parameter names simple and consistent across tools (`pid` everywhere, not sometimes `project_id`)
+
+### Step 2: Implement the PHP Method
+
+Each tool method follows the same pattern:
+
+```php
+public function toolMyAction(array $payload)
+{
+    // 1. Validate required parameters
+    if (empty($payload['param1'])) {
+        return [
+            "error" => true,
+            "message" => "Missing required parameter: param1"
+        ];
+    }
+
+    // 2. Extract and type-cast parameters
+    $param1 = $payload['param1'];
+    $param2 = (int)($payload['param2'] ?? 10);
+
+    try {
+        // 3. Call REDCap API or do your work
+        $result = \REDCap::someMethod($param1, $param2);
+
+        // 4. Return structured result
+        return [
+            "param1" => $param1,
+            "result_count" => count($result),
+            "results" => $result
+        ];
+    } catch (\Exception $e) {
+        // 5. Log and return error
+        $this->emError("myAction error: " . $e->getMessage());
+        return [
+            "error" => true,
+            "message" => "Failed to do the thing: " . $e->getMessage()
+        ];
+    }
+}
+```
+
+**Rules:**
+- Never throw exceptions past the method boundary — always return an error array
+- Always validate required params before doing work
+- Always wrap the core logic in try-catch
+- Return `"error" => true` on failure (this triggers HTTP 400 in `wrapResponse`)
+- Log errors with `$this->emError()` and debug info with `$this->emDebug()`
+
+### Step 3: Wire It Up in the Router
+
+Add a case to the switch in `redcap_module_api()`:
+
+```php
+case "my_action_name":
+    return $this->wrapResponse(
+        $this->toolMyAction($payload)
+    );
+```
+
+The action string must match the key in `api-actions` in config.json.
+
+### Step 4: Test It
+
+```bash
+curl -X POST https://your-redcap/api/ \
+  -d "token=YOUR_TOKEN" \
+  -d "content=externalModule" \
+  -d "prefix=your_module_prefix" \
+  -d "action=my_action_name" \
+  -d 'payload={"param1":"test"}'
+```
+
+There's also a built-in debug endpoint:
+```bash
+curl -X POST https://your-redcap/api/ \
+  -d "token=YOUR_TOKEN" \
+  -d "content=externalModule" \
+  -d "prefix=redcap_agent_record_tools" \
+  -d "action=debug" \
+  -d 'payload={"anything":"here"}'
+```
+
+This echoes back the parsed action and payload — useful for verifying your request is structured correctly.
+
+### Full Walkthrough: Adding a New Tool to This Module
+
+Let's say you want to add a `records.delete` tool. Here's every change:
+
+**1. Add to `api-actions` in config.json:**
+```json
+"records_delete": {
+    "description": "Agent tool: delete a record by record ID",
+    "access": ["auth"]
+}
+```
+
+**2. Add to `agent-tool-definitions` in config.json:**
 ```json
 {
-  "pid": 42,
-  "success": true,
-  "records_saved": 1,
-  "record_ids": ["1001"],
-  "warnings": [],
-  "overwrite_mode": true
+    "name": "records.delete",
+    "description": "Permanently delete a record from a REDCap project. This cannot be undone.",
+    "api-action": "records_delete",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "pid": {"type": "integer", "description": "REDCap project ID"},
+            "record_id": {"type": "string", "description": "The record ID to delete"}
+        },
+        "required": ["pid", "record_id"]
+    },
+    "readOnly": false,
+    "destructive": true
 }
 ```
 
-**Error Response:**
-```json
+**3. Add the switch case in `redcap_module_api()`:**
+```php
+case "records_delete":
+    return $this->wrapResponse(
+        $this->toolDeleteRecord($payload)
+    );
+```
+
+**4. Implement the method:**
+```php
+public function toolDeleteRecord(array $payload)
 {
-  "error": true,
-  "message": "Failed to save data",
-  "errors": [
-    "Field 'age' has invalid value 'abc' (must be integer)"
-  ],
-  "warnings": [],
-  "data_submitted": { /* echoed data */ }
+    if (empty($payload['pid'])) {
+        return ["error" => true, "message" => "Missing required parameter: pid"];
+    }
+    if (empty($payload['record_id'])) {
+        return ["error" => true, "message" => "Missing required parameter: record_id"];
+    }
+
+    $pid = (int)$payload['pid'];
+    $record_id = $payload['record_id'];
+
+    try {
+        // Your delete logic here
+        $result = \Records::deleteRecord($record_id, ..., $pid);
+
+        return [
+            "pid" => $pid,
+            "record_id" => $record_id,
+            "deleted" => true
+        ];
+    } catch (\Exception $e) {
+        $this->emError("deleteRecord error for pid $pid: " . $e->getMessage());
+        return ["error" => true, "message" => "Failed to delete record: " . $e->getMessage()];
+    }
 }
 ```
 
-**Use Cases:**
-- Creating new participant records
-- Updating form completion status
-- Bulk data import from agent-processed sources
-- Correcting data errors conversationally
+---
+
+## Architecture & Design Principles
+
+| Component | Role |
+|-----------|------|
+| **Cappy / Other UX** | User interface (chatbot, data entry form, etc.) |
+| **SecureChatAI EM** | Agent routing & LLM orchestration |
+| **REDCapAgentRecordTools** | Atomic record/project operations (this module) |
+| **LLM** | Planner, not executor |
+
+**Design rules this module follows:**
+- Tools are **atomic** and single-purpose
+- No orchestration logic (SecureChatAI's job)
+- No LLM calls (this is a data layer)
+- No UI (purely API-driven)
+- Deterministic behavior only
+- Every tool call is independently auditable
 
 ---
 
 ## Security Model
 
-### Current State (Phase 1: Raw Capability Layer)
+### Current State
 
-- Tools are callable **only** via authenticated REDCap API requests
-- API token grants access to **ALL projects** (no user-level filtering)
-- This module never accepts free-form prompts
-- All operations use REDCap's native methods (getData, saveData, etc.)
-- **⚠️ IMPORTANT:** Currently in "unlimited power" mode - governance layer required for production
+- Tools are invoked by SecureChatAI via direct PHP calls (EM-to-EM, same process — no HTTP, no API token needed)
+- External access is possible via the REDCap API with an API token, but not required for normal agent workflows
+- The module never accepts free-form prompts
+- All operations use REDCap's native methods (`getData`, `saveData`, etc.)
+- `projects.search` currently returns all matching projects with no user-level filtering
 
-### Planned Governance (Phase 2)
+### Planned (Phase 2): Governance Layer
 
-A **Tools Registry Project** will provide data-driven permission control:
-
-- **Project-Level Permissions**: Allowlist/denylist which tools are available per project
-- **User-Level Permissions**: Control which users can access which projects
-- **Rate Limiting**: Prevent abuse with configurable call limits
-- **Audit Logging**: Track all tool usage (user, tool, target project, timestamp, success/failure)
-- **Tool Auto-Registration**: EMs self-register on enable, no code changes needed
-
-**Example Governance Schema:**
-```
-Tools Registry Project (PID 61)
-├─ Tool Definitions (auto-populated)
-│  └─ [tool_name, description, parameters, em_prefix, risk_level]
-├─ Project Permissions (admin-configured)
-│  └─ [target_pid, allowed_tools, denied_tools, rate_limit]
-├─ User Permissions (admin-configured)
-│  └─ [username, allowed_projects, access_level, expiration]
-└─ Usage Audit Log (auto-logged)
-   └─ [timestamp, username, tool, target_pid, success, error_msg]
-```
+A Tools Registry Project will provide:
+- Project-level permission allowlists/denylists
+- User-level access control
+- Rate limiting
+- Full audit logging of all tool invocations
 
 ---
 
-## Design Principles
+## Supported REDCap Features
 
-- Tools are **atomic** and single-purpose
-- No orchestration (that's SecureChatAI's job)
-- No LLM calls (this is a data layer, not AI)
-- No UI (purely API-driven)
-- Deterministic behavior only
-
-This ensures:
-
-- Easy auditing (every tool call is logged)
-- Clear separation of concerns
-- Safe expansion of agent capabilities
-- Predictable behavior for agents
+| Feature | Status |
+|---------|--------|
+| Classic projects | ✅ Full support |
+| Longitudinal projects | ✅ Via optional `events` / `event` parameters |
+| Repeating instruments | ✅ Full support |
+| Repeating events | ✅ Via getData/saveData |
+| File upload fields | ⚠️ Can detect presence, cannot verify file validity |
+| Calculated fields | ⚠️ Read-only (cannot force recalculation) |
+| Branching logic | ⚠️ Returned in metadata, not enforced on save |
 
 ---
 
-## Implementation Details
+## Related Modules
 
-### REDCap Methods Used
-
-| Tool | REDCap Method | Purpose |
-|------|---------------|---------|
-| `projects.search` | Direct DB query (`redcap_projects`) | Fuzzy search across project titles |
-| `projects.getMetadata` | `REDCap::getDataDictionary()` | Field definitions and validation rules |
-| `projects.getInstruments` | `REDCap::getInstrumentNames()` | Form/survey listing |
-| `records.get` | `REDCap::getData()` | Single record retrieval |
-| `records.search` | `REDCap::getData()` with filter param | Record queries with logic filtering |
-| `records.evaluateLogic` | `REDCap::evaluateLogic()` | Boolean logic evaluation |
-| `records.save` | `REDCap::saveData()` | Create/update records with validation |
-| `survey.getLink` | `REDCap::getSurveyLink()` | Survey URL generation |
-
-### Error Handling
-
-All tools:
-- Validate required parameters before execution
-- Wrap operations in try-catch blocks
-- Return structured JSON with `error: true` on failure
-- Include descriptive error messages for debugging
-- Log errors via emLoggerTrait
-
-### Supported REDCap Features
-
-✅ **Classic Projects** - Full support
-✅ **Longitudinal Projects** - Events supported via optional parameters
-✅ **Repeating Instruments** - Full support (instance detection automatic)
-✅ **Repeating Events** - Supported via getData/saveData
-✅ **File Upload Fields** - Can detect presence, cannot verify file validity
-✅ **Calculated Fields** - Read-only (cannot force recalculation)
-✅ **Branching Logic** - Returned in metadata, not enforced on save
-
-### Performance Considerations
-
-- `projects.search` queries the entire `redcap_projects` table (add indexes if needed)
-- `projects.getMetadata` returns full data dictionary (can be 100KB+ for large projects)
-- `records.search` with complex filters may be slow on large datasets
-- No caching implemented (REDCap's native caching applies)
-
----
-
-## Installation & Setup
-
-1. **Enable the EM** on the "Tools Registry Project" (recommended) or any project
-2. **Generate API Token** for the project
-3. **Configure SecureChatAI** with the API token and tool registry JSON
-4. **Test tools** via curl or SecureChatAI agent loop
-
-**Smoke Test:**
-```bash
-curl -X POST http://localhost/api/ \
-  -d "token=YOUR_API_TOKEN" \
-  -d "content=externalModule" \
-  -d "prefix=redcap_agent_record_tools" \
-  -d "action=projects_search" \
-  -d 'payload={"query":"test"}'
-```
-
----
-
-## Future Enhancements
-
-- [ ] **Tool Auto-Registration**: EMs register themselves in Tools Registry Project on enable
-- [ ] **Permission Enforcement**: Check user/project permissions before executing tools
-- [ ] **Rate Limiting**: Configurable throttling per user/project
-- [ ] **Audit Logging**: Write usage logs to Tools Registry Project
-- [ ] **Batch Operations**: Support array of record operations in single call
-- [ ] **Caching Layer**: Cache metadata/instrument lists for performance
-- [ ] **Delete Operations**: `records.delete` with confirmation workflow
-- [ ] **Advanced Search**: Full-text search across record data
-- [ ] **Data Export**: `records.export` in CSV/JSON formats
-- [ ] **File Operations**: Upload/download file attachments via tools
-
----
-
-## Contributing
-
-This EM is part of the **REDCap AI Ecosystem**. See main project documentation for architecture decisions and contribution guidelines.
-
-**Related EMs:**
-- `secure_chat_ai_v9.9.9` - Agent orchestration and LLM routing
-- `redcap_rag_v9.9.9` - Document ingestion and retrieval
-- `redcap-em-chatbot_v9.9.9` - Conversational UI (Cappy)
+- [`secure_chat_ai`](https://github.com/susom/secureChatAI) — Agent orchestration and LLM routing
+- `redcap_rag` — Document ingestion and retrieval
+- `redcap-em-chatbot` (Cappy) — Conversational UI
 

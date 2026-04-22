@@ -558,27 +558,25 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
         $data = $payload['data'];
         $overwrite = $payload['overwrite'] ?? false; // Default: normal (not overwrite)
 
-        // Ensure data is in array format (can be single record or multiple)
-        // REDCap::saveData expects array of records
-        if (!isset($data[0])) {
-            // Single record object, wrap it in array
-            $data = [$data];
-        }
-
         try {
             $saveMode = $overwrite ? 'overwrite' : 'normal';
 
-            // REDCap::saveData returns array with:
-            // - 'errors' => array of error messages (empty if successful)
-            // - 'warnings' => array of warnings
-            // - 'item_count' => number of items saved
-            // - 'ids' => array of record IDs saved
-            $result = \REDCap::saveData(
-                $pid,
-                'array',
-                $data,
-                $saveMode
-            );
+            // Normalize data to flat format for saveData('json').
+            // The LLM may send either:
+            //   Flat:   {"cas_id": "123", "field": "value"}
+            //   Nested: {"123": {"cas_id": "123", "field": "value"}}
+            // Detect nested format (values are arrays, keys are non-numeric) and flatten.
+            $firstValue = reset($data);
+            if (is_array($firstValue) && !isset($data[0])) {
+                $data = array_values($data);
+            }
+
+            // Wrap single record in array
+            if (!isset($data[0])) {
+                $data = [$data];
+            }
+
+            $result = \REDCap::saveData($pid, 'json', json_encode($data), $saveMode);
 
             // Check for errors
             if (!empty($result['errors'])) {

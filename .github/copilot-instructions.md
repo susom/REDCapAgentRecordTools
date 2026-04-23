@@ -11,14 +11,14 @@ This is a **REDCap External Module (EM)** that exposes 8 agent tools as API endp
 - **This EM** → atomic record/project operations (called by LLM via SecureChatAI)
 - **LLM** → planner, not executor
 
-All 8 tools are invoked through a single entry point: `redcap_module_api($action, $payload)`, which dispatches to `tool*` methods via a switch statement. Each tool method validates parameters, calls a REDCap static method (e.g., `\REDCap::getData()`, `\REDCap::saveData()`), and returns a structured array. The `wrapResponse()` helper converts this to a JSON HTTP response, setting status 400 when an `error` key is present.
+All 8 tools are invoked through a single entry point: `redcap_module_api($action, $payload)`, which dispatches to `tool*` methods via a switch statement. In production, SecureChatAI calls this via EM-to-EM direct PHP (`getModuleInstance()->redcap_module_api()`). External access via HTTP API is also supported. Each tool method validates parameters, calls a REDCap static method (e.g., `\REDCap::getData()`, `\REDCap::saveData()`), and returns a structured array. The `wrapResponse()` helper converts this to a JSON HTTP response, setting status 400 when an `error` key is present.
 
 ## Key Conventions
 
 - **Namespace:** `Stanford\REDCapAgentRecordTools`
 - **Framework version:** 14 (REDCap EM Framework)
-- **Auto-discovery:** SecureChatAI discovers tool EMs by prefix. Any enabled EM named `redcap_agent_*` with `agent-tool-definitions` in config.json is auto-discovered. This module follows that convention.
-- **Tool registration:** Tools are declared in `config.json` under both `api-actions` (for REDCap routing) and `agent-tool-definitions` (for LLM tool schemas). Both must stay in sync when adding/modifying tools.
+- **Auto-discovery:** SecureChatAI discovers tool EMs by matching their prefix against the **Agent Tool EM Prefixes** list (configurable in SecureChatAI settings). The `redcap_agent_*` prefix is a recommended convention, not a hard requirement. Any EM whose prefix is in the list and has `agent-tool-definitions` in config.json is auto-discovered.
+- **Tool registration:** Tools are declared in `config.json` under both `api-actions` (future-proofing for external API access) and `agent-tool-definitions` (for LLM tool schemas). Both must stay in sync when adding/modifying tools.
 - **Action naming:** API actions use `snake_case` with category prefix (e.g., `records_save`, `projects_search`). Agent tool names use `dot.notation` (e.g., `records.save`, `projects.search`).
 - **Error pattern:** Every tool returns `["error" => true, "message" => "..."]` on failure. Never throw exceptions past tool boundaries.
 - **Logging:** Uses `emLoggerTrait` — call `$this->emDebug()` for debug, `$this->emError()` for errors. Requires the `em_logger` EM to be installed; gracefully degrades if absent.

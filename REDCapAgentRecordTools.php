@@ -13,12 +13,19 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
     }
 
     /**
-     * Main API entry point for agent tools
+     * API Router — redcap_module_api()
+     *
+     * Single entry point for all tool calls. Called two ways:
+     *   - EM-to-EM (primary): SecureChatAI calls getModuleInstance()->redcap_module_api()
+     *   - HTTP API (testing/external): curl with content=externalModule&prefix=...
      */
     public function redcap_module_api($action = null, $payload = [])
     {
-        // Normalize payload
-        // REDCap API framework passes payload as ['payload' => '{"json":"string"}']
+        // --- Normalize payload ---
+        // Two entry paths send payload differently:
+        //   - EM-to-EM: payload arrives as a PHP array directly
+        //   - HTTP API: payload arrives as a JSON string in $_POST['payload']
+        // This block handles both transparently.
         if (!empty($payload['payload'])) {
             $payloadData = json_decode($payload['payload'], true);
             if (json_last_error() === JSON_ERROR_NONE) {

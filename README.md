@@ -95,7 +95,7 @@ This requires an API token for a project where the EM is enabled. For normal age
 
 ## Tool Reference
 
-Every tool is called via the REDCap External Module API. The request always looks like:
+Every tool is called through `redcap_module_api($action, $payload)`. In production, SecureChatAI handles this via EM-to-EM PHP calls. For direct testing, you can also call via the REDCap API:
 
 ```
 POST /api/
@@ -411,18 +411,18 @@ Generate a survey URL. The instrument must be survey-enabled in the project.
 
 This section explains how to create a new External Module that exposes tools to SecureChatAI, **or** how to add more tools to this module. The config.json structure is the tricky part, so we'll go through it carefully.
 
-> **Starter template available:** See [`redcap_agent_template`](https://github.com/susom/REDCapAgentTemplate) for a minimal, copy-and-go template EM with all the boilerplate already wired up.
+> **Starter template available:** See [`redcap_agent_tool_template`](https://github.com/susom/REDCapAgentToolTemplate) for a minimal, copy-and-go template EM with all the boilerplate already wired up.
 
-### Auto-Discovery via Naming Convention
+### Auto-Discovery
 
-SecureChatAI discovers tool EMs by **prefix matching**. Any enabled EM whose prefix starts with `redcap_agent_` is scanned for `agent-tool-definitions` in its config.json.
+SecureChatAI discovers tool EMs by matching their prefix against the **Agent Tool EM Prefixes** list (configurable at system or project level in SecureChatAI). Any EM whose prefix matches an entry in that list — and has `agent-tool-definitions` in its config.json — will be discovered.
 
-**To make your tool EM auto-discoverable:**
-1. Name your module directory `redcap_agent_<something>_v9.9.9`
+The `redcap_agent_` prefix is a **convention**, not a hard requirement. You could name your module anything and it would work as long as you add its prefix to SecureChatAI's prefix list. That said, `redcap_agent_*` is recommended — it makes tool EMs instantly recognizable.
+
+**To make your tool EM discoverable:**
+1. Add your EM's prefix to SecureChatAI's **Agent Tool EM Prefixes**
 2. Include `agent-tool-definitions` in your config.json
-3. Enable the EM in REDCap
-
-SecureChatAI's EM settings control which prefix to scan (e.g., `redcap_agent_`). This gives you plug-and-play discovery with a namespace gate — new tool EMs are picked up automatically, but only if they follow the naming convention.
+3. Enable the EM system-wide in REDCap
 
 ### The Big Picture
 
@@ -444,7 +444,7 @@ config.json                         PHP Class
 └─────────────────────┘
 ```
 
-- **`api-actions`** — Registers URL endpoints with REDCap's EM framework. This is what makes `/api/?action=my_action` work.
+- **`api-actions`** — Registers actions with REDCap's EM framework. Not strictly required for EM-to-EM calls, but future-proofs your tools for external API access and upcoming framework features.
 - **`agent-tool-definitions`** — Describes each tool in JSON Schema format so the LLM knows how to call it. The `api-action` field links back to the corresponding `api-actions` entry.
 - **PHP switch case** — Routes the action string to the method that does the work.
 
@@ -506,7 +506,7 @@ The minimum config for a tool EM:
 
 - The **key** (`my_action_name`) becomes the `action` parameter in API calls
 - Convention: use `snake_case` with a category prefix — `records_get`, `projects_search`, `files_upload`
-- Always use `"access": ["auth"]` so calls require a valid API token
+- Use `"access": ["auth"]` for authenticated access (recommended), or `["public"]` if you have a reason
 
 #### `agent-tool-definitions` — explained
 
@@ -604,6 +604,23 @@ case "my_action_name":
 The action string must match the key in `api-actions` in config.json.
 
 ### Step 4: Test It
+
+**End-to-end via SecureChatAI (recommended):**
+
+Call SecureChatAI's API with agent mode — this tests the full production flow:
+
+```bash
+curl -X POST https://your-redcap/api/ \
+  -d "token=YOUR_SECURECHAT_PROJECT_TOKEN" \
+  -d "content=externalModule" \
+  -d "prefix=secure_chat_ai" \
+  -d "action=callAI" \
+  -d 'payload={"message":"Search for projects matching test","agent_mode":true}'
+```
+
+**Direct API call (isolation testing):**
+
+Enable the tool EM on a project, get an API token, and call the tool directly:
 
 ```bash
 curl -X POST https://your-redcap/api/ \

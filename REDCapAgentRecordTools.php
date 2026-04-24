@@ -13,119 +13,51 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
     }
 
     /**
-     * API Router — redcap_module_api()
+     * Tool Router — handleToolCall()
      *
-     * Single entry point for all tool calls. Called two ways:
-     *   - EM-to-EM (primary): SecureChatAI calls getModuleInstance()->redcap_module_api()
-     *   - HTTP API (testing/external): curl with content=externalModule&prefix=...
+     * Single entry point for all tool calls. Called by SecureChatAI via:
+     *   getModuleInstance($prefix)->handleToolCall($action, $input)
+     *
+     * EM-to-EM direct PHP call — no HTTP, no API tokens.
      */
-    public function redcap_module_api($action = null, $payload = [])
+    public function handleToolCall(string $action, array $payload = []): array
     {
-        // --- Normalize payload ---
-        // Two entry paths send payload differently:
-        //   - EM-to-EM: payload arrives as a PHP array directly
-        //   - HTTP API: payload arrives as a JSON string in $_POST['payload']
-        // This block handles both transparently.
-        if (!empty($payload['payload'])) {
-            $payloadData = json_decode($payload['payload'], true);
-            if (json_last_error() === JSON_ERROR_NONE) {
-                $payload = $payloadData;
-            }
-        } elseif (empty($payload)) {
-            // Fallback: check if payload is passed as a POST parameter (common for curl -d)
-            if (!empty($_POST['payload'])) {
-                $payload = json_decode($_POST['payload'], true);
-                if (json_last_error() !== JSON_ERROR_NONE) {
-                    return $this->wrapResponse([
-                        "error" => true,
-                        "message" => "Invalid JSON in payload parameter"
-                    ], 400);
-                }
-            } else {
-                // Try reading raw input (for application/json content-type)
-                $raw = file_get_contents("php://input");
-                $decoded = json_decode($raw, true);
-                if (json_last_error() === JSON_ERROR_NONE) {
-                    $payload = $decoded;
-                } else {
-                    $payload = $_POST;
-                }
-            }
-        }
-
-        $this->emDebug("AgentRecordTools API call", [
+        $this->emDebug("Agent tool call", [
             'action' => $action,
-            'payload' => $payload,
-            'raw_POST' => $_POST,
-            'payload_type' => gettype($payload)
+            'payload' => $payload
         ]);
-
-        // Debug endpoint
-        if ($action === 'debug') {
-            return $this->wrapResponse([
-                "debug" => true,
-                "action" => $action,
-                "payload" => $payload,
-                "payload_type" => gettype($payload),
-                "POST" => $_POST
-            ]);
-        }
 
         switch ($action) {
             case "projects_getMetadata":
-                return $this->wrapResponse(
-                    $this->toolGetMetadata($payload)
-                );
+                return $this->toolGetMetadata($payload);
 
             case "projects_getInstruments":
-                return $this->wrapResponse(
-                    $this->toolGetInstruments($payload)
-                );
+                return $this->toolGetInstruments($payload);
 
             case "records_get":
-                return $this->wrapResponse(
-                    $this->toolGetRecord($payload)
-                );
+                return $this->toolGetRecord($payload);
 
             case "records_search":
-                return $this->wrapResponse(
-                    $this->toolSearchRecords($payload)
-                );
+                return $this->toolSearchRecords($payload);
 
             case "survey_getLink":
-                return $this->wrapResponse(
-                    $this->toolGetSurveyLink($payload)
-                );
+                return $this->toolGetSurveyLink($payload);
 
             case "records_evaluateLogic":
-                return $this->wrapResponse(
-                    $this->toolEvaluateLogic($payload)
-                );
+                return $this->toolEvaluateLogic($payload);
 
             case "projects_search":
-                return $this->wrapResponse(
-                    $this->toolSearchProjects($payload)
-                );
+                return $this->toolSearchProjects($payload);
 
             case "records_save":
-                return $this->wrapResponse(
-                    $this->toolSaveRecords($payload)
-                );
+                return $this->toolSaveRecords($payload);
 
             default:
-                return $this->wrapResponse([
+                return [
                     "error" => true,
                     "message" => "Unknown action: $action"
-                ], 400);
+                ];
         }
-    }
-
-    private function wrapResponse(array $result, int $defaultStatus = 200){
-        return [
-            "status" => isset($result['error']) ? 400 : $defaultStatus,
-            "body" => json_encode($result),
-            "headers" => ["Content-Type" => "application/json"]
-        ];
     }
 
     /**

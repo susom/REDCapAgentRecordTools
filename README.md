@@ -41,7 +41,7 @@ User → Cappy (or other UX) → SecureChatAI (Agent Orchestrator) → THIS MODU
 1. User asks something in natural language ("What's my intake status for the Cancer study?")
 2. The calling EM (Cappy, MSPA, or any EM) calls `$secureChatAI->callAI()` with `agent_mode => true`
 3. SecureChatAI's LLM decides which tool(s) to call and with what parameters
-4. SecureChatAI invokes this module's `redcap_module_api()` internally (no API token needed)
+4. SecureChatAI invokes this module's `handleToolCall()` via direct PHP (no API token needed)
 5. This module executes the corresponding REDCap operation and returns structured JSON
 6. The LLM uses the result to compose a human-readable response
 
@@ -57,7 +57,7 @@ User → Cappy (or other UX) → SecureChatAI (Agent Orchestrator) → THIS MODU
    - System-wide: `agent_tool_em_prefixes` setting
    - Or per-project: `project_agent_tool_em_prefixes` setting (overrides system)
 
-That's it. SecureChatAI auto-discovers the tools from this module's config.json and invokes them via direct PHP calls (EM-to-EM). No API token, no HTTP requests, no network — just one EM calling another's `redcap_module_api()` method in the same process.
+That's it. SecureChatAI auto-discovers the tools from this module's `tools.json` manifest and invokes them via direct PHP calls (EM-to-EM). No API token, no HTTP requests, no network — just one EM calling another's `handleToolCall()` method in the same process.
 
 ### Calling from another EM
 
@@ -76,37 +76,13 @@ $response = $secureChatAI->callAI('gpt-4.1', [
 
 SecureChatAI handles tool discovery, LLM routing, and the agent loop. Your EM just sends the prompt.
 
-### External access (optional)
-
-If you need to call tools from **outside** REDCap (external services, curl, testing), you can use the REDCap API with an API token:
-
-```bash
-curl -X POST https://your-redcap-instance/api/ \
-  -d "token=YOUR_API_TOKEN" \
-  -d "content=externalModule" \
-  -d "prefix=redcap_agent_record_tools" \
-  -d "action=projects_search" \
-  -d 'payload={"query":"test"}'
-```
-
-This requires an API token for a project where the EM is enabled. For normal agent workflows within REDCap, this is unnecessary.
-
 ---
 
 ## Tool Reference
 
-Every tool is called through `redcap_module_api($action, $payload)`. In production, SecureChatAI handles this via EM-to-EM PHP calls. For direct testing, you can also call via the REDCap API:
+Every tool is called through `handleToolCall($action, $payload)`. In production, SecureChatAI handles this via EM-to-EM PHP calls. Tool definitions live in `tools.json`.
 
-```
-POST /api/
-  token=<API_TOKEN>
-  content=externalModule
-  prefix=redcap_agent_record_tools
-  action=<ACTION_NAME>
-  payload=<JSON_STRING>
-```
-
-All tools return JSON. On success, you get the result object. On failure, you get:
+All tools return associative arrays. On success, you get the result. On failure, you get:
 ```json
 {"error": true, "message": "What went wrong"}
 ```
@@ -409,68 +385,52 @@ Generate a survey URL. The instrument must be survey-enabled in the project.
 
 ## How to Build Your Own Tool EM
 
-This section explains how to create a new External Module that exposes tools to SecureChatAI, **or** how to add more tools to this module. The config.json structure is the tricky part, so we'll go through it carefully.
+This section explains how to create a new External Module that exposes tools to SecureChatAI, **or** how to add more tools to this module.
 
 > **Starter template available:** See [`redcap_agent_tool_template`](https://github.com/susom/REDCapAgentToolTemplate) for a minimal, copy-and-go template EM with all the boilerplate already wired up.
 
 ### Auto-Discovery
 
-SecureChatAI discovers tool EMs by matching their prefix against the **Agent Tool EM Prefixes** list (configurable at system or project level in SecureChatAI). Any EM whose prefix matches an entry in that list — and has `agent-tool-definitions` in its config.json — will be discovered.
+SecureChatAI discovers tool EMs by matching their prefix against the **Agent Tool EM Prefixes** list (configurable at system or project level in SecureChatAI). Any EM whose prefix matches an entry in that list — and has a `tools.json` manifest — will be discovered.
 
 The `redcap_agent_` prefix is a **convention**, not a hard requirement. You could name your module anything and it would work as long as you add its prefix to SecureChatAI's prefix list. That said, `redcap_agent_*` is recommended — it makes tool EMs instantly recognizable.
 
 **To make your tool EM discoverable:**
 1. Add your EM's prefix to SecureChatAI's **Agent Tool EM Prefixes**
-2. Include `agent-tool-definitions` in your config.json
+2. Include a `tools.json` file with tool definitions
 3. Enable the EM system-wide in REDCap
 
 ### The Big Picture
 
-A tool EM has three pieces that must stay in sync:
+A tool EM has two pieces that must stay in sync:
 
 ```
-config.json                         PHP Class
-┌─────────────────────┐            ┌──────────────────────┐
-│ "api-actions": {    │ ───maps──→ │ redcap_module_api()  │
-│   "my_action": {}   │            │   case "my_action":  │
-│ }                   │            │     return toolX()   │
-│                     │            └──────────────────────┘
-│ "agent-tool-        │
-│  definitions": [{   │ ───tells LLM──→ what tools exist
-│   "name": "x.y",   │                  and how to call them
-│   "api-action":     │
-│     "my_action"     │
-│ }]                  │
-└─────────────────────┘
+tools.json                          PHP Class
+┌─────────────────────┐            ┌──────────────────────────┐
+│                     │            │                          │
+│  "action":          │ ───maps──→ │  handleToolCall()        │
+│    "my_action"      │            │    case "my_action":     │
+│                     │            │      return toolX()      │
+│  "name": "x.y"     │            │                          │
+│  "parameters": {}   │ ─tells LLM→ what tools exist         │
+│                     │            │  and how to call them    │
+└─────────────────────┘            └──────────────────────────┘
 ```
 
-- **`api-actions`** — Registers actions with REDCap's EM framework. Not strictly required for EM-to-EM calls, but future-proofs your tools for external API access and upcoming framework features.
-- **`agent-tool-definitions`** — Describes each tool in JSON Schema format so the LLM knows how to call it. The `api-action` field links back to the corresponding `api-actions` entry.
+- **`tools.json`** — Declares each tool in JSON Schema format so the LLM knows how to call it. The `action` field links to the PHP switch case.
 - **PHP switch case** — Routes the action string to the method that does the work.
 
-### Step 1: Create config.json
+### Step 1: Create tools.json
 
-The minimum config for a tool EM:
+The tool manifest declares your tools for SecureChatAI's auto-discovery:
 
 ```json
 {
-  "name": "MyAgentTools",
-  "namespace": "Stanford\\MyAgentTools",
-  "description": "Agent tools for doing X",
-  "framework-version": 14,
-
-  "api-actions": {
-    "my_action_name": {
-      "description": "What this endpoint does",
-      "access": ["auth"]
-    }
-  },
-
-  "agent-tool-definitions": [
+  "tools": [
     {
       "name": "category.toolName",
       "description": "A clear description the LLM will read to decide when to use this tool",
-      "api-action": "my_action_name",
+      "action": "my_action_name",
       "parameters": {
         "type": "object",
         "properties": {
@@ -493,49 +453,16 @@ The minimum config for a tool EM:
 }
 ```
 
-#### `api-actions` — explained
+**Key fields:**
 
-```json
-"api-actions": {
-  "my_action_name": {         // ← This string is passed as $action to redcap_module_api()
-    "description": "...",     // ← Human-readable, for documentation
-    "access": ["auth"]        // ← Requires API authentication
-  }
-}
-```
-
-- The **key** (`my_action_name`) becomes the `action` parameter in API calls
-- Convention: use `snake_case` with a category prefix — `records_get`, `projects_search`, `files_upload`
-- Use `"access": ["auth"]` for authenticated access (recommended), or `["public"]` if you have a reason
-
-#### `agent-tool-definitions` — explained
-
-This is the part the **LLM reads** to decide what tools are available and how to call them. Each entry follows JSON Schema:
-
-```json
-{
-  "name": "records.get",              // LLM-facing name (dot notation)
-  "description": "...",               // LLM reads this to decide when to use the tool
-  "api-action": "records_get",        // Must match a key in api-actions
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "pid": {
-        "type": "integer",            // JSON Schema types: string, integer, number, boolean, array, object
-        "description": "..."          // LLM reads this to know what value to pass
-      },
-      "fields": {
-        "type": "array",
-        "items": {"type": "string"},  // Array of strings
-        "description": "..."
-      }
-    },
-    "required": ["pid"]               // Which params the LLM must always provide
-  },
-  "readOnly": true,                   // Hint: this tool only reads data
-  "destructive": false                // Hint: this tool won't delete anything
-}
-```
+| Field | Purpose |
+|-------|---------|
+| `name` | LLM-facing name in `dot.notation` (e.g., `records.get`) |
+| `description` | THE most important field — the LLM reads this to decide when to use the tool |
+| `action` | Must exactly match a `case` in `handleToolCall()` — the linking key |
+| `parameters` | JSON Schema defining what the LLM must/can pass |
+| `readOnly` | Hint: `true` = read-only, `false` = modifies data |
+| `destructive` | Hint: `true` = deletes or irreversibly changes data |
 
 **Tips for good tool definitions:**
 - The `description` is the most important field — a vague description means the LLM won't know when to pick the tool
@@ -587,21 +514,19 @@ public function toolMyAction(array $payload)
 - Never throw exceptions past the method boundary — always return an error array
 - Always validate required params before doing work
 - Always wrap the core logic in try-catch
-- Return `"error" => true` on failure (this triggers HTTP 400 in `wrapResponse`)
+- Return `"error" => true` on failure — this signals an error to the orchestrator
 - Log errors with `$this->emError()` and debug info with `$this->emDebug()`
 
 ### Step 3: Wire It Up in the Router
 
-Add a case to the switch in `redcap_module_api()`:
+Add a case to the switch in `handleToolCall()`:
 
 ```php
 case "my_action_name":
-    return $this->wrapResponse(
-        $this->toolMyAction($payload)
-    );
+    return $this->toolMyAction($payload);
 ```
 
-The action string must match the key in `api-actions` in config.json.
+The action string must match the `action` field in tools.json.
 
 ### Step 4: Test It
 
@@ -618,49 +543,26 @@ curl -X POST https://your-redcap/api/ \
   -d 'payload={"message":"Search for projects matching test","agent_mode":true}'
 ```
 
-**Direct API call (isolation testing):**
+**Direct PHP call (unit/integration testing):**
 
-Enable the tool EM on a project, get an API token, and call the tool directly:
+Since `handleToolCall()` is a plain PHP method, you can call it directly from any test harness:
 
-```bash
-curl -X POST https://your-redcap/api/ \
-  -d "token=YOUR_TOKEN" \
-  -d "content=externalModule" \
-  -d "prefix=your_module_prefix" \
-  -d "action=my_action_name" \
-  -d 'payload={"param1":"test"}'
+```php
+$toolEM = \ExternalModules\ExternalModules::getModuleInstance('redcap_agent_record_tools');
+$result = $toolEM->handleToolCall('projects_search', ['query' => 'test']);
+// $result = ["query" => "test", "match_count" => 3, "projects" => [...]]
 ```
-
-There's also a built-in debug endpoint:
-```bash
-curl -X POST https://your-redcap/api/ \
-  -d "token=YOUR_TOKEN" \
-  -d "content=externalModule" \
-  -d "prefix=redcap_agent_record_tools" \
-  -d "action=debug" \
-  -d 'payload={"anything":"here"}'
-```
-
-This echoes back the parsed action and payload — useful for verifying your request is structured correctly.
 
 ### Full Walkthrough: Adding a New Tool to This Module
 
 Let's say you want to add a `records.delete` tool. Here's every change:
 
-**1. Add to `api-actions` in config.json:**
-```json
-"records_delete": {
-    "description": "Agent tool: delete a record by record ID",
-    "access": ["auth"]
-}
-```
-
-**2. Add to `agent-tool-definitions` in config.json:**
+**1. Add to `tools.json`:**
 ```json
 {
     "name": "records.delete",
     "description": "Permanently delete a record from a REDCap project. This cannot be undone.",
-    "api-action": "records_delete",
+    "action": "records_delete",
     "parameters": {
         "type": "object",
         "properties": {
@@ -674,12 +576,10 @@ Let's say you want to add a `records.delete` tool. Here's every change:
 }
 ```
 
-**3. Add the switch case in `redcap_module_api()`:**
+**2. Add the switch case in `handleToolCall()`:**
 ```php
 case "records_delete":
-    return $this->wrapResponse(
-        $this->toolDeleteRecord($payload)
-    );
+    return $this->toolDeleteRecord($payload);
 ```
 
 **4. Implement the method:**
@@ -738,7 +638,7 @@ public function toolDeleteRecord(array $payload)
 ### Current State
 
 - Tools are invoked by SecureChatAI via direct PHP calls (EM-to-EM, same process — no HTTP, no API token needed)
-- External access is possible via the REDCap API with an API token, but not required for normal agent workflows
+- There is no external HTTP surface — `handleToolCall()` is only reachable from other EMs
 - The module never accepts free-form prompts
 - All operations use REDCap's native methods (`getData`, `saveData`, etc.)
 - `projects.search` currently returns all matching projects with no user-level filtering

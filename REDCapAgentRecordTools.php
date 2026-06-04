@@ -13,14 +13,15 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
     }
 
     /**
-     * Tool Router — handleToolCall()
+     * Tool Router — redcap_module_api()
      *
-     * Single entry point for all tool calls. Called by SecureChatAI via:
-     *   getModuleInstance($prefix)->handleToolCall($action, $input)
-     *
-     * EM-to-EM direct PHP call — no HTTP, no API tokens.
+     * Standard REDCap hook — entry point for all tool calls.
+     * Called by SecureChatAI via EM-to-EM:
+     *   getModuleInstance($prefix)->redcap_module_api($action, $payload)
+     * Also callable externally via the REDCap API:
+     *   POST /api/ ... content=externalModule&prefix=...&action=...
      */
-    public function handleToolCall(string $action, array $payload = []): array
+    public function redcap_module_api($action = null, $payload = [])
     {
         $this->emDebug("Agent tool call", [
             'action' => $action,

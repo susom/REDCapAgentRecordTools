@@ -18,7 +18,18 @@
 	"permissions": [
 
 	],
-	
+
+	"api-actions": [
+		"projects_search",
+		"projects_getMetadata",
+		"projects_getInstruments",
+		"records_get",
+		"records_search",
+		"records_evaluateLogic",
+		"survey_getLink",
+		"records_save"
+	],
+
 	"framework-version": 14,
     "enable-every-page-hooks-on-system-pages": false,
 

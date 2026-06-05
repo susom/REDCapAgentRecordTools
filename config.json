@@ -19,16 +19,16 @@
 
 	],
 
-	"api-actions": [
-		"projects_search",
-		"projects_getMetadata",
-		"projects_getInstruments",
-		"records_get",
-		"records_search",
-		"records_evaluateLogic",
-		"survey_getLink",
-		"records_save"
-	],
+	"api-actions": {
+		"projects_search":        { "description": "Agent tool: search for projects by name/description", "access": ["auth"] },
+		"projects_getMetadata":   { "description": "Agent tool: get data dictionary for a project",       "access": ["auth"] },
+		"projects_getInstruments":{ "description": "Agent tool: list all instruments in a project",        "access": ["auth"] },
+		"records_get":            { "description": "Agent tool: get specific record data by record ID",    "access": ["auth"] },
+		"records_search":         { "description": "Agent tool: search records with optional logic filter","access": ["auth"] },
+		"records_evaluateLogic":  { "description": "Agent tool: evaluate REDCap logic for a record",      "access": ["auth"] },
+		"survey_getLink":         { "description": "Agent tool: generate survey link for a record",        "access": ["auth"] },
+		"records_save":           { "description": "Agent tool: create or update record data",             "access": ["auth"] }
+	},
 
 	"framework-version": 14,
     "enable-every-page-hooks-on-system-pages": false,

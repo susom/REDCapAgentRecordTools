@@ -2,6 +2,16 @@
 
 namespace Stanford\REDCapAgentRecordTools;
 
+// SecureChatAI may not be loaded yet at EM boot — load its interfaces directly.
+if (!interface_exists('Stanford\SecureChatAI\PreToolUseHook')) {
+    $scaClasses = dirname(__DIR__, 2) . '/secure_chat_ai_v9.9.9/classes';
+    require_once $scaClasses . '/HookInterface.php';
+    require_once $scaClasses . '/HookResult.php';
+    require_once $scaClasses . '/ToolUse.php';
+    require_once $scaClasses . '/ToolContext.php';
+    require_once $scaClasses . '/AbortController.php';
+}
+
 use Stanford\SecureChatAI\HookResult;
 use Stanford\SecureChatAI\PreToolUseHook;
 use Stanford\SecureChatAI\ToolContext;

@@ -28,8 +28,8 @@ use Stanford\SecureChatAI\ToolUse;
  */
 class PhiFieldPreHook implements PreToolUseHook
 {
-    /** Per-request cache: pid → [phi_field, ...] */
-    private static array $phiFieldCache = [];
+    /** Per-request cache: pid → ['phi' => [...], 'safe' => [...]] */
+    private static array $fieldCache = [];
 
     private const RECORD_ACTIONS = ['records.get', 'records.search', 'records.save'];
 
@@ -51,42 +51,71 @@ class PhiFieldPreHook implements PreToolUseHook
             return HookResult::allow();
         }
 
-        $phiFields = $this->getPhiFields($pid);
+        $fields    = $this->getFieldSets($pid);
+        $phiFields = $fields['phi'];
+
         if (empty($phiFields)) {
             return HookResult::allow();
         }
 
-        $requestedFields = $use->name === 'records.save'
-            ? $this->extractSaveFields($use->input['data'] ?? [])
-            : ($use->input['fields'] ?? null); // null = all fields
+        $modelLabel = $model ?: 'unknown';
 
-        // null means all fields were requested — PHI would be included
-        $blocked = $requestedFields === null
-            ? $phiFields
-            : array_values(array_intersect($requestedFields, $phiFields));
+        if ($use->name === 'records.save') {
+            // Block saves that write any PHI field
+            $requested = $this->extractSaveFields($use->input['data'] ?? []);
+            $blocked   = array_values(array_intersect($requested, $phiFields));
+            if (empty($blocked)) {
+                return HookResult::allow();
+            }
+            return HookResult::deny(
+                "PHI write blocked: model '{$modelLabel}' does not have a BAA. " .
+                "Cannot save identifier fields: " . implode(', ', $blocked) . "."
+            );
+        }
 
+        // records.get / records.search
+        $requested = $use->input['fields'] ?? null; // null = all fields
+
+        if ($requested === null) {
+            // All fields requested — tell the agent which ones are safe to ask for
+            $safeList = implode(', ', $fields['safe']);
+            return HookResult::deny(
+                "Cannot return all fields: model '{$modelLabel}' does not have a BAA. " .
+                "PHI fields blocked: " . implode(', ', $phiFields) . ". " .
+                "Please re-request with specific non-PHI fields. Available fields: {$safeList}."
+            );
+        }
+
+        // Specific fields requested — only block if they overlap with PHI
+        $blocked = array_values(array_intersect($requested, $phiFields));
         if (empty($blocked)) {
             return HookResult::allow();
         }
 
-        $modelLabel = $model ?: 'unknown';
         return HookResult::deny(
             "PHI field access blocked: model '{$modelLabel}' does not have a BAA. " .
-            "Identifier fields requested: " . implode(', ', $blocked) . ". " .
-            "Switch to a Gemini model to access PHI fields, or exclude these fields from your request."
+            "Requested identifier fields: " . implode(', ', $blocked) . ". " .
+            "Remove those fields from your request."
         );
     }
 
-    /** Returns field names marked as identifiers for the given project. Cached per request. */
-    private function getPhiFields(int $pid): array
+    /** Returns ['phi' => [...], 'safe' => [...]] for the project. Cached per request. */
+    private function getFieldSets(int $pid): array
     {
-        if (!isset(self::$phiFieldCache[$pid])) {
+        if (!isset(self::$fieldCache[$pid])) {
             $metadata = \REDCap::getDataDictionary($pid, 'array', false);
-            self::$phiFieldCache[$pid] = array_keys(
-                array_filter($metadata, fn($f) => strtolower($f['identifier'] ?? '') === 'y')
-            );
+            $phi = [];
+            $safe = [];
+            foreach ($metadata as $fieldName => $f) {
+                if (strtolower($f['identifier'] ?? '') === 'y') {
+                    $phi[] = $fieldName;
+                } else {
+                    $safe[] = $fieldName;
+                }
+            }
+            self::$fieldCache[$pid] = ['phi' => $phi, 'safe' => $safe];
         }
-        return self::$phiFieldCache[$pid];
+        return self::$fieldCache[$pid];
     }
 
     /** Extracts field names from the save payload (handles both flat and nested record format). */

@@ -2,6 +2,7 @@
 namespace Stanford\REDCapAgentRecordTools;
 
 require_once "emLoggerTrait.php";
+require_once "classes/PhiFieldPreHook.php";
 
 class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
 

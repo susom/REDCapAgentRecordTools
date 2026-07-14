@@ -8,6 +8,13 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
 
     use emLoggerTrait;
 
+    // Hard cap on records.search results per call — prevents dumping an entire
+    // project's record set into the chat window. Callers page through with
+    // offset/limit if they genuinely need more (e.g. for analysis), and the
+    // "truncated" flag + message steer the agent toward Data Exports for
+    // full-record-set requests instead.
+    const MAX_RECORDS_RETURNED = 50;
+
     public function __construct()
     {
         parent::__construct();
@@ -233,12 +240,19 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
         $filter = $payload['filter'] ?? null; // REDCap logic string like "[age] > 18"
         $fields = $payload['fields'] ?? null; // Optional
         $return_format = $payload['return_format'] ?? 'array'; // 'array' or 'json'
+        $offset = max(0, (int)($payload['offset'] ?? 0));
+        $limit = (int)($payload['limit'] ?? self::MAX_RECORDS_RETURNED);
+        if ($limit <= 0 || $limit > self::MAX_RECORDS_RETURNED) {
+            $limit = self::MAX_RECORDS_RETURNED;
+        }
 
         try {
+            // Always fetch as 'array' internally so we can slice by record for pagination;
+            // converted to the requested return_format after slicing.
             $data = \REDCap::getData(
                 $pid,
-                $return_format,
-                null,        // all records (filter applied via $filterLogic)
+                'array',
+                null,        // all matching records (filter applied via $filterLogic)
                 $fields,
                 null,        // events
                 null,        // groups
@@ -248,14 +262,32 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 $filter      // REDCap logic filter
             );
 
-            $record_count = is_array($data) ? count($data) : 0;
+            $total_record_count = is_array($data) ? count($data) : 0;
+            $page = is_array($data) ? array_slice($data, $offset, $limit, true) : [];
+            $returned_count = count($page);
+            $truncated = ($offset + $returned_count) < $total_record_count;
 
-            return [
+            $result = [
                 "pid" => $pid,
                 "filter" => $filter,
-                "record_count" => $record_count,
-                "records" => $data
+                "total_record_count" => $total_record_count,
+                "returned_count" => $returned_count,
+                "offset" => $offset,
+                "limit" => $limit,
+                "truncated" => $truncated,
+                "records" => $return_format === 'json' ? json_encode($page) : $page
             ];
+
+            if ($truncated) {
+                $result["message"] = "Showing $returned_count of $total_record_count matching records "
+                    . "(offset $offset). Do not try to list or summarize the full record set in chat — if the "
+                    . "user wants the complete record set, tell them to use Data Exports, Reports, and Stats "
+                    . "(left nav under Applications) instead, and offer to highlight that link with page.highlight "
+                    . "if page actions are available. Use offset/limit to page through results only if you need "
+                    . "more records for a specific analysis.";
+            }
+
+            return $result;
         } catch (\Exception $e) {
             $this->emError("searchRecords error for pid $pid: " . $e->getMessage());
             return [

@@ -61,25 +61,55 @@
 			"readOnly": true,
 			"destructive": false
 		},
-		{
-			"name": "records.search",
-			"description": "Search records in a REDCap project with an optional REDCap logic filter expression. Returns matching records and their data, capped at 50 records per call (page through with offset if needed). This tool is for looking up or analyzing specific records — it is NOT meant to dump a project's entire record set into chat. If a user asks for the full/entire record set, tell them to use Data Exports, Reports, and Stats instead. Use REDCap logic syntax for filters, e.g. '[age] > 18' or '[status] = \"1\"'.",
-			"action": "records_search",
-			"parameters": {
-				"type": "object",
-				"properties": {
-					"pid": {"type": "integer", "description": "REDCap project ID"},
-					"filter": {"type": "string", "description": "REDCap logic filter expression, e.g. '[field_name] > 18'. Omit to match all records (still capped/paginated by limit/offset)."},
-					"fields": {"type": "array", "items": {"type": "string"}, "description": "Optional list of specific field names to include in results"},
-					"return_format": {"type": "string", "enum": ["array", "json"], "description": "Response format", "default": "array"},
-					"limit": {"type": "integer", "description": "Max records to return in this call. Hard-capped at 50 regardless of value given.", "default": 50},
-					"offset": {"type": "integer", "description": "Number of matching records to skip, for paging through results beyond the per-call cap.", "default": 0}
-				},
-				"required": ["pid"]
-			},
-			"readOnly": true,
-			"destructive": false
-		},
+{
+      "name": "records.search",
+      "description": "Search records in a REDCap project with an optional REDCap logic filter expression. Returns matching records and their data, capped at 50 records per call (page through with offset if needed). This tool is for looking up or analyzing specific records — it is NOT meant to dump a project's entire record set into chat. If a user asks for the full/entire record set, tell them to use Data Exports, Reports, and Stats instead. Use REDCap logic syntax for filters, e.g. '[age] > 18' or '[status] = \"1\"'. For pure counts without data, prefer records.count; for ID-only enumeration, prefer records.listIds.",
+      "action": "records_search",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pid": {"type": "integer", "description": "REDCap project ID"},
+          "filter": {"type": "string", "description": "REDCap logic filter expression, e.g. '[field_name] > 18'. Omit to match all records (still capped/paginated by limit/offset)."},
+          "fields": {"type": "array", "items": {"type": "string"}, "description": "Optional list of specific field names to include in results"},
+          "return_format": {"type": "string", "enum": ["array", "json"], "description": "Response format", "default": "array"},
+          "limit": {"type": "integer", "description": "Max records to return in this call. Hard-capped at 50 regardless of value given.", "default": 50},
+          "offset": {"type": "integer", "description": "Number of matching records to skip, for paging through results beyond the per-call cap.", "default": 0}
+        },
+        "required": ["pid"]
+      },
+      "readOnly": true,
+      "destructive": false
+    },
+    {
+      "name": "records.count",
+      "description": "Return the number of records in a REDCap project matching an optional REDCap logic filter. No record data is returned — only the count. Cheap alternative to records.search when the user only wants a count (e.g. 'how many records are there?', 'how many consented?').",
+      "action": "records_count",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pid": {"type": "integer", "description": "REDCap project ID"},
+          "filter": {"type": "string", "description": "Optional REDCap logic filter, e.g. '[consent] = \"1\"'. Omit to count all records."}
+        },
+        "required": ["pid"]
+      },
+      "readOnly": true,
+      "destructive": false
+    },
+    {
+      "name": "records.listIds",
+      "description": "Return just the record IDs in a REDCap project (no field data). Use when the user asks for a list of record IDs and doesn't need the data — avoids pulling PHI into context unnecessarily. Supports the same filter as records.count/records.search.",
+      "action": "records_listIds",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pid": {"type": "integer", "description": "REDCap project ID"},
+          "filter": {"type": "string", "description": "Optional REDCap logic filter, e.g. '[consent] = \"1\"'. Omit to list all record IDs."}
+        },
+        "required": ["pid"]
+      },
+      "readOnly": true,
+      "destructive": false
+    },
 		{
 			"name": "records.evaluateLogic",
 			"description": "Evaluate a REDCap logic expression against a specific record. Returns true or false. Useful for checking eligibility criteria or branching conditions.",

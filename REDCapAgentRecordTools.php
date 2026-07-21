@@ -49,6 +49,12 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             case "records_search":
                 return $this->toolSearchRecords($payload);
 
+            case "records_count":
+                return $this->toolCountRecords($payload);
+
+            case "records_listIds":
+                return $this->toolListRecordIds($payload);
+
             case "survey_getLink":
                 return $this->toolGetSurveyLink($payload);
 
@@ -293,6 +299,112 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             return [
                 "error" => true,
                 "message" => "Failed to search records: " . $e->getMessage()
+            ];
+        }
+    }
+
+    /**
+     * Tool 6b: records.count
+     * Return only the count of records matching an optional REDCap logic filter.
+     * No record data is fetched — single cheap call.
+     */
+    public function toolCountRecords(array $payload)
+    {
+        if (empty($payload['pid'])) {
+            return [
+                "error" => true,
+                "message" => "Missing required parameter: pid"
+            ];
+        }
+
+        $pid = (int)$payload['pid'];
+        $filter = $payload['filter'] ?? null;
+
+        try {
+            $data = \REDCap::getData(
+                $pid,
+                'array',
+                null,    // all matching records
+                null,    // no fields needed — we only count
+                null,    // events
+                null,    // groups
+                false,   // combine checkbox values
+                false,   // DAG
+                false,   // survey fields
+                $filter  // REDCap logic filter
+            );
+
+            $count = is_array($data) ? count($data) : 0;
+            $recordIdField = \REDCap::getRecordIdField($pid);
+
+            return [
+                "pid"      => $pid,
+                "filter"   => $filter,
+                "count"    => $count,
+                "record_id_field" => $recordIdField,
+                "note"     => "This is the count of records matching the filter (or all records if no filter). No record data was returned."
+            ];
+        } catch (\Exception $e) {
+            $this->emError("countRecords error for pid $pid: " . $e->getMessage());
+            return [
+                "error"   => true,
+                "message" => "Failed to count records: " . $e->getMessage()
+            ];
+        }
+    }
+
+    /**
+     * Tool 6c: records.listIds
+     * Return just the record IDs in a project (no field data). Useful when
+     * the user wants to enumerate record IDs without pulling PHI into context.
+     * Returns IDs in REDCap's natural order.
+     */
+    public function toolListRecordIds(array $payload)
+    {
+        if (empty($payload['pid'])) {
+            return [
+                "error" => true,
+                "message" => "Missing required parameter: pid"
+            ];
+        }
+
+        $pid = (int)$payload['pid'];
+        $filter = $payload['filter'] ?? null;
+
+        try {
+            $data = \REDCap::getData(
+                $pid,
+                'array',
+                null,
+                null,
+                null,
+                null,
+                false,
+                false,
+                false,
+                $filter
+            );
+
+            $recordIdField = \REDCap::getRecordIdField($pid);
+            // getData('array') returns [record_id => [event => [field => value]]] for
+            // longitudinal, or [record_id => [field => value]] for classic. Either way
+            // the top-level keys are record IDs.
+            $ids = is_array($data) ? array_keys($data) : [];
+            sort($ids, SORT_NATURAL);
+
+            return [
+                "pid"             => $pid,
+                "filter"          => $filter,
+                "count"           => count($ids),
+                "record_id_field" => $recordIdField,
+                "record_ids"      => $ids,
+                "note"            => "Record IDs only — no field data returned. For full record contents use records.get or Data Exports."
+            ];
+        } catch (\Exception $e) {
+            $this->emError("listRecordIds error for pid $pid: " . $e->getMessage());
+            return [
+                "error"   => true,
+                "message" => "Failed to list record IDs: " . $e->getMessage()
             ];
         }
     }

@@ -97,7 +97,7 @@
     },
 		{
 			"name": "records.listIds",
-			"description": "Return just the record IDs in a REDCap project (no field data). Use when the user asks for a list of record IDs and doesn't need the data — avoids pulling PHI into context unnecessarily. Supports the same filter as records.count/records.search. When more than 50 IDs match, the full list is cached server-side in the PHP session and a short reference id is returned; pass that reference back to retrieve a page.",
+			"description": "Return just the record IDs in a REDCap project (no field data). PREFER THIS TOOL over records.search when the user asks for record IDs only, a count of records, or a specific range of record IDs — it returns the same data with much less context cost. Use records.search only when the user wants field values too. Supports the same filter as records.count/records.search. When more than 50 IDs match, the full list is cached server-side in the PHP session and a short reference id is returned; pass that reference back to retrieve a page.",
 			"action": "records_listIds",
 			"parameters": {
 				"type": "object",

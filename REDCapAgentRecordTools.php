@@ -131,6 +131,7 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
         }
     }
 
+
     /**
      * Tool 4: projects.getInstruments
      * List all instruments/forms in a project
@@ -252,6 +253,40 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             $limit = self::MAX_RECORDS_RETURNED;
         }
 
+        // Reference path: load from PHP session and return a slice. Avoids
+        // re-querying when the LLM is paging through a previously-cached result.
+        $reference = $payload['reference'] ?? null;
+        if ($reference) {
+            $cached = $this->cappyCacheFetch($reference, 'records_search');
+            if ($cached === null) {
+                return [
+                    "error" => true,
+                    "message" => "Reference $reference not found or expired. Call the tool again without 'reference' to re-query."
+                ];
+            }
+            if (($cached['pid'] ?? null) !== $pid) {
+                return [
+                    "error" => true,
+                    "message" => "Reference $reference was cached for a different project (expected $pid, got " . ($cached['pid'] ?? 'null') . ")."
+                ];
+            }
+            $ids = $cached['ids'];
+            $page = array_slice($ids, $offset, $limit, true);
+            $returned_count = count($page);
+            return [
+                "pid" => $pid,
+                "filter" => $filter,
+                "reference" => $reference,
+                "total_record_count" => count($ids),
+                "returned_count" => $returned_count,
+                "offset" => $offset,
+                "limit" => $limit,
+                "truncated" => ($offset + $returned_count) < count($ids),
+                "records" => $return_format === 'json' ? json_encode($page) : $page,
+                "note" => "Served from session cache (reference $reference).",
+            ];
+        }
+
         try {
             // Always fetch as 'array' internally so we can slice by record for pagination;
             // converted to the requested return_format after slicing.
@@ -269,6 +304,32 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             );
 
             $total_record_count = is_array($data) ? count($data) : 0;
+
+            // Large result: cache the full thing in PHP session and return a ref +
+            // a small preview. The LLM can call back with the ref to page through.
+            // Threshold = double the per-call cap (50) since showing 50 inline is fine.
+            if ($total_record_count > self::MAX_RECORDS_RETURNED * 2) {
+                $ref = $this->cappyCacheStore('records_search', [
+                    'pid' => $pid,
+                    'filter' => $filter,
+                    'ids' => $data,
+                ]);
+                $preview_ids = array_slice($data, 0, 10, true);
+                return [
+                    "pid" => $pid,
+                    "filter" => $filter,
+                    "total_record_count" => $total_record_count,
+                    "returned_count" => 0,
+                    "offset" => 0,
+                    "limit" => 10,
+                    "truncated" => true,
+                    "reference" => $ref,
+                    "preview" => $return_format === 'json' ? json_encode($preview_ids) : $preview_ids,
+                    "records" => [],
+                    "message" => "Result is large ($total_record_count records). Cached server-side in the PHP session. Use the 'reference' parameter to page through it: records.search(pid=$pid, reference=\"$ref\", offset=N, limit=M). The cache auto-expires after 10 minutes."
+                ];
+            }
+
             $page = is_array($data) ? array_slice($data, $offset, $limit, true) : [];
             $returned_count = count($page);
             $truncated = ($offset + $returned_count) < $total_record_count;
@@ -370,6 +431,42 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
 
         $pid = (int)$payload['pid'];
         $filter = $payload['filter'] ?? null;
+        $offset = max(0, (int)($payload['offset'] ?? 0));
+        $limit = (int)($payload['limit'] ?? 50);
+        if ($limit <= 0 || $limit > 200) $limit = 50;
+        $reference = $payload['reference'] ?? null;
+
+        // Reference path: serve from PHP session cache
+        if ($reference) {
+            $cached = $this->cappyCacheFetch($reference, 'records_listIds');
+            if ($cached === null) {
+                return [
+                    "error" => true,
+                    "message" => "Reference $reference not found or expired. Call the tool again without 'reference' to re-query."
+                ];
+            }
+            if (($cached['pid'] ?? null) !== $pid) {
+                return [
+                    "error" => true,
+                    "message" => "Reference $reference was cached for a different project."
+                ];
+            }
+            $ids = $cached['ids'];
+            $slice = array_slice($ids, $offset, $limit);
+            return [
+                "pid" => $pid,
+                "filter" => $filter,
+                "reference" => $reference,
+                "count" => count($ids),
+                "returned_count" => count($slice),
+                "offset" => $offset,
+                "limit" => $limit,
+                "record_id_field" => $cached['record_id_field'] ?? null,
+                "record_ids" => $slice,
+                "truncated" => ($offset + count($slice)) < count($ids),
+                "note" => "Served from session cache (reference $reference).",
+            ];
+        }
 
         try {
             $data = \REDCap::getData(
@@ -386,18 +483,46 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             );
 
             $recordIdField = \REDCap::getRecordIdField($pid);
-            // getData('array') returns [record_id => [event => [field => value]]] for
-            // longitudinal, or [record_id => [field => value]] for classic. Either way
-            // the top-level keys are record IDs.
             $ids = is_array($data) ? array_keys($data) : [];
             sort($ids, SORT_NATURAL);
+
+            // Large list: cache and return a ref + small preview
+            if (count($ids) > $limit * 2) {
+                $ref = $this->cappyCacheStore('records_listIds', [
+                    'pid' => $pid,
+                    'filter' => $filter,
+                    'record_id_field' => $recordIdField,
+                    'ids' => $ids,
+                ]);
+                $preview = array_slice($ids, 0, 10);
+                return [
+                    "pid" => $pid,
+                    "filter" => $filter,
+                    "reference" => $ref,
+                    "count" => count($ids),
+                    "returned_count" => 0,
+                    "offset" => 0,
+                    "limit" => 10,
+                    "record_id_field" => $recordIdField,
+                    "record_ids_preview" => $preview,
+                    "record_ids" => [],
+                    "truncated" => true,
+                    "note" => "Result is large (" . count($ids) . " IDs). Cached server-side in the PHP session. Use records.listIds(pid=$pid, reference=\"$ref\", offset=N, limit=M) to page through."
+                ];
+            }
+
+            $slice = array_slice($ids, $offset, $limit);
 
             return [
                 "pid"             => $pid,
                 "filter"          => $filter,
                 "count"           => count($ids),
+                "returned_count"  => count($slice),
+                "offset"          => $offset,
+                "limit"           => $limit,
                 "record_id_field" => $recordIdField,
-                "record_ids"      => $ids,
+                "record_ids"      => $slice,
+                "truncated"       => ($offset + count($slice)) < count($ids),
                 "note"            => "Record IDs only — no field data returned. For full record contents use records.get or Data Exports."
             ];
         } catch (\Exception $e) {
@@ -686,8 +811,62 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             $this->emError("saveRecords error for pid $pid: " . $e->getMessage());
             return [
                 "error" => true,
-                "message" => "Failed to save records: " . $e->getMessage()
-            ];
+                 "message" => "Failed to save records: " . $e->getMessage()
+             ];
+         }
+     }
+
+    // -----------------------------------------------------------------
+    // Session cache for large tool results. The LLM gets a short reference
+    // id; the full data lives in $_SESSION for the lifetime of the session
+    // (default 10 min, configurable below). Survives iframe reloads, full
+    // page reloads, and any same-session navigation — the whole point of
+    // building this client-of-server instead of the earlier sessionStorage
+    // plan.
+    // -----------------------------------------------------------------
+
+    /** TTL for cached tool results, in seconds. */
+    const CAPPY_CACHE_TTL = 600;
+
+    /**
+     * Stash $payload in the PHP session under a short random reference id
+     * and return that reference. Caller passes the reference back to retrieve
+     * the data (via cappyCacheFetch). Auto-prunes expired entries on every call.
+     */
+    private function cappyCacheStore(string $key, $payload): string
+    {
+        if (!isset($_SESSION['cappy_data_cache'])) {
+            $_SESSION['cappy_data_cache'] = [];
         }
+        $now = time();
+        // Prune expired entries (cheap; usually a few)
+        foreach ($_SESSION['cappy_data_cache'] as $k => $entry) {
+            if (($entry['expires_at'] ?? 0) < $now) {
+                unset($_SESSION['cappy_data_cache'][$k]);
+            }
+        }
+        $ref = 'ref_' . bin2hex(random_bytes(4));
+        $_SESSION['cappy_data_cache'][$ref] = [
+            'data' => $payload,
+            'expires_at' => $now + self::CAPPY_CACHE_TTL,
+            'stored_at' => $now,
+        ];
+        return $ref;
+    }
+
+    /**
+     * Fetch a cached payload by reference. Returns null if missing or expired.
+     */
+    private function cappyCacheFetch(string $ref, ?string $expectedKey = null)
+    {
+        if (!isset($_SESSION['cappy_data_cache'][$ref])) {
+            return null;
+        }
+        $entry = $_SESSION['cappy_data_cache'][$ref];
+        if (($entry['expires_at'] ?? 0) < time()) {
+            unset($_SESSION['cappy_data_cache'][$ref]);
+            return null;
+        }
+        return $entry['data'];
     }
 }

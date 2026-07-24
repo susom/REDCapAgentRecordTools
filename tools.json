@@ -95,21 +95,24 @@
       "readOnly": true,
       "destructive": false
     },
-    {
-      "name": "records.listIds",
-      "description": "Return just the record IDs in a REDCap project (no field data). Use when the user asks for a list of record IDs and doesn't need the data — avoids pulling PHI into context unnecessarily. Supports the same filter as records.count/records.search.",
-      "action": "records_listIds",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "pid": {"type": "integer", "description": "REDCap project ID"},
-          "filter": {"type": "string", "description": "Optional REDCap logic filter, e.g. '[consent] = \"1\"'. Omit to list all record IDs."}
-        },
-        "required": ["pid"]
-      },
-      "readOnly": true,
-      "destructive": false
-    },
+		{
+			"name": "records.listIds",
+			"description": "Return just the record IDs in a REDCap project (no field data). Use when the user asks for a list of record IDs and doesn't need the data — avoids pulling PHI into context unnecessarily. Supports the same filter as records.count/records.search. When more than 50 IDs match, the full list is cached server-side in the PHP session and a short reference id is returned; pass that reference back to retrieve a page.",
+			"action": "records_listIds",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"pid": {"type": "integer", "description": "REDCap project ID"},
+					"filter": {"type": "string", "description": "Optional REDCap logic filter, e.g. '[consent] = \"1\"'. Omit to list all record IDs."},
+					"reference": {"type": "string", "description": "If a previous call returned a reference, pass it here to retrieve a paginated slice instead of re-querying."},
+					"offset": {"type": "integer", "description": "For paging through a referenced result. Defaults to 0.", "default": 0},
+					"limit": {"type": "integer", "description": "Max IDs to return in this call. Defaults to 50.", "default": 50}
+				},
+				"required": ["pid"]
+			},
+			"readOnly": true,
+			"destructive": false
+		},
 		{
 			"name": "records.evaluateLogic",
 			"description": "Evaluate a REDCap logic expression against a specific record. Returns true or false. Useful for checking eligibility criteria or branching conditions.",

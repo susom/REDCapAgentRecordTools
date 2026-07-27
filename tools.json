@@ -63,16 +63,19 @@
 		},
 {
       "name": "records.search",
-      "description": "Search records in a REDCap project with an optional REDCap logic filter expression. Returns matching records and their data, capped at 50 records per call (page through with offset if needed). This tool is for looking up or analyzing specific records — it is NOT meant to dump a project's entire record set into chat. If a user asks for the full/entire record set, tell them to use Data Exports, Reports, and Stats instead. Use REDCap logic syntax for filters, e.g. '[age] > 18' or '[status] = \"1\"'. For pure counts without data, prefer records.count; for ID-only enumeration, prefer records.listIds.",
+      "description": "Search records in a REDCap project with an optional REDCap logic filter expression. Returns: total_record_count, a 'reference' id (the FULL result set, cached server-side in the PHP session), and 'preview_markdown' — a ready-made markdown table of the first 20 rows with sensible columns. ALWAYS render preview_markdown verbatim to the user; never ask which fields to show. Raw record rows are withheld by default (keeps context small) — pass include_records=true with a modest limit only when you need raw values for computation. For follow-up questions about the same data, DO NOT start a new search: pass the 'reference' back with a NEW 'filter' to narrow the cached recordset in memory (no database round trip), or with offset/limit to page (each page returns its own preview_markdown). When the user wants to ACCUMULATE ('also add severity 4', 'include those too'), use 'append_to' with the new filter — only the new slice is queried, then merged into the working set. Use REDCap logic syntax for filters, e.g. '[age] > 18'. For pure counts, prefer records.count; for ID-only enumeration, prefer records.listIds.",
       "action": "records_search",
       "parameters": {
         "type": "object",
         "properties": {
           "pid": {"type": "integer", "description": "REDCap project ID"},
-          "filter": {"type": "string", "description": "REDCap logic filter expression, e.g. '[field_name] > 18'. Omit to match all records (still capped/paginated by limit/offset)."},
-          "fields": {"type": "array", "items": {"type": "string"}, "description": "Optional list of specific field names to include in results"},
-          "return_format": {"type": "string", "enum": ["array", "json"], "description": "Response format", "default": "array"},
-          "limit": {"type": "integer", "description": "Max records to return in this call. Hard-capped at 50 regardless of value given.", "default": 50},
+          "filter": {"type": "string", "description": "REDCap logic filter expression, e.g. '[field_name] > 18'. Omit to match all records. When combined with 'reference', the filter is applied to the cached recordset instead of the database."},
+          "reference": {"type": "string", "description": "Reference id from a previous records.search call. Pass it to page through (offset/limit) or narrow (new filter) the cached result set without re-querying."},
+          "append_to": {"type": "string", "description": "Reference id from a previous records.search call. When the user wants to ACCUMULATE results ('also show me severity 4', 'add those to the list'), pass append_to + a new filter: only the new slice is queried, then UNIONED into the cached set. Use 'reference' instead when the user wants to narrow or replace the current set."},
+          "fields": {"type": "array", "items": {"type": "string"}, "description": "Optional list of specific field names to include in results. Omit to get all fields — recommended, so follow-up filters on any field can be served from cache."},
+          "return_format": {"type": "string", "enum": ["array", "json"], "description": "Response format for raw rows (only used when include_records=true)", "default": "array"},
+          "include_records": {"type": "boolean", "description": "If true, include raw record rows in the response. Default false — preview_markdown + reference are usually all you need.", "default": false},
+          "limit": {"type": "integer", "description": "Max records to return in this call (uncapped — the full result set is cached server-side regardless). Defaults to 1000. If total_record_count exceeds ~1000, suggest the user narrow their filter instead of paging through everything.", "default": 1000},
           "offset": {"type": "integer", "description": "Number of matching records to skip, for paging through results beyond the per-call cap.", "default": 0}
         },
         "required": ["pid"]

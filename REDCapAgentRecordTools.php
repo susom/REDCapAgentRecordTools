@@ -8,12 +8,11 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
 
     use emLoggerTrait;
 
-    // Hard cap on records.search results per call — prevents dumping an entire
-    // project's record set into the chat window. Callers page through with
-    // offset/limit if they genuinely need more (e.g. for analysis), and the
-    // "truncated" flag + message steer the agent toward Data Exports for
-    // full-record-set requests instead.
-    const MAX_RECORDS_RETURNED = 50;
+    // No hard cap on records.search results — REDCap itself doesn't cap, and
+    // the full result set is always cached server-side regardless. This is
+    // just the DEFAULT page size; past ~1000 records the response notes steer
+    // the agent toward suggesting the user narrow their filter.
+    const MAX_RECORDS_RETURNED = 1000;
 
     public function __construct()
     {
@@ -36,6 +35,20 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             'payload' => $payload
         ]);
 
+        $response = $this->routeToolCall($action, $payload);
+
+        // Log the response (truncated) so we can verify what the LLM actually
+        // received — e.g. that preview_markdown survived serialization.
+        $this->emDebug("Agent tool response", [
+            'action' => $action,
+            'response_json' => substr((string)json_encode($response, JSON_UNESCAPED_UNICODE), 0, 8000),
+        ]);
+
+        return $response;
+    }
+
+    private function routeToolCall($action, $payload)
+    {
         switch ($action) {
             case "projects_getMetadata":
                 return $this->toolGetMetadata($payload);
@@ -245,16 +258,63 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
 
         $pid = (int)$payload['pid'];
         $filter = $payload['filter'] ?? null; // REDCap logic string like "[age] > 18"
+
+        // Validate filter field names against the data dictionary — a typo'd
+        // field silently returns 0 records and sends the agent flailing.
+        // Return a hard error with close-match suggestions instead.
+        if (!empty($filter)) {
+            $fieldError = $this->cappyValidateFilterFields($pid, $filter);
+            if ($fieldError !== null) return $fieldError;
+        }
         $fields = $payload['fields'] ?? null; // Optional
         $return_format = $payload['return_format'] ?? 'array'; // 'array' or 'json'
         $offset = max(0, (int)($payload['offset'] ?? 0));
+        // No upper clamp — caller may request as many as they want (default
+        // page size is MAX_RECORDS_RETURNED). The note flags large result
+        // sets so the agent can suggest narrowing instead of paging forever.
         $limit = (int)($payload['limit'] ?? self::MAX_RECORDS_RETURNED);
-        if ($limit <= 0 || $limit > self::MAX_RECORDS_RETURNED) {
+        if ($limit <= 0) {
             $limit = self::MAX_RECORDS_RETURNED;
         }
+        // Raw rows are withheld by default — the LLM gets preview_markdown for
+        // display and a reference for filtering/paging. Inlining hundreds of
+        // full-width records bloats the context window and makes models
+        // refuse to render ("due to space limits..."). Set include_records
+        // only when the raw rows are genuinely needed for computation.
+        $includeRecords = !empty($payload['include_records']);
+        $formatRecords = function ($page) use ($return_format, $includeRecords) {
+            if (!$includeRecords) return [];
+            return $return_format === 'json' ? json_encode($page) : $page;
+        };
 
-        // Reference path: load from PHP session and return a slice. Avoids
-        // re-querying when the LLM is paging through a previously-cached result.
+        // Append path: run the new filter as a fresh query, then UNION the
+        // results into the referenced cached recordset (the "accumulating
+        // working set" — e.g. severity=3 set, then "also severity=4" merges
+        // into one 532-record set). Only the new slice hits the database.
+        $appendTo = $payload['append_to'] ?? null;
+        $appendBase = null;
+        if ($appendTo) {
+            $appendBase = $this->cappyCacheFetch($appendTo, 'records_search');
+            if ($appendBase === null) {
+                return [
+                    "error" => true,
+                    "message" => "append_to reference $appendTo not found or expired. Call the tool again without 'append_to' to start a new query."
+                ];
+            }
+            if (($appendBase['pid'] ?? null) !== $pid) {
+                return [
+                    "error" => true,
+                    "message" => "append_to reference $appendTo was cached for a different project."
+                ];
+            }
+        }
+
+        // Reference path: reuse the PHP session cache instead of re-querying.
+        // Two modes:
+        //   1. reference + same/no filter  → page through the cached recordset
+        //   2. reference + NEW filter      → apply the filter against the cached
+        //      recordset in memory (evaluateLogic with inline record_data, no
+        //      getData round trip), cache the subset under a new reference
         $reference = $payload['reference'] ?? null;
         if ($reference) {
             $cached = $this->cappyCacheFetch($reference, 'records_search');
@@ -270,21 +330,52 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                     "message" => "Reference $reference was cached for a different project (expected $pid, got " . ($cached['pid'] ?? 'null') . ")."
                 ];
             }
-            $ids = $cached['ids'];
-            $page = array_slice($ids, $offset, $limit, true);
+
+            $data = $cached['ids'];
+            $cachedFilter = trim((string)($cached['filter'] ?? ''));
+            $newFilter = trim((string)($filter ?? ''));
+            $filteredFromCache = false;
+
+            // Mode 2: new filter → narrow the cached recordset in memory
+            if ($newFilter !== '' && $newFilter !== $cachedFilter) {
+                $data = $this->cappyFilterCachedRecords($pid, $data, $newFilter);
+                $filteredFromCache = true;
+                // Cache the narrowed subset so follow-ups can chain off it
+                $reference = $this->cappyCacheStore('records_search', [
+                    'pid' => $pid,
+                    'filter' => $newFilter,
+                    'ids' => $data,
+                ]);
+            }
+
+            $total = count($data);
+            $page = array_slice($data, $offset, $limit, true);
             $returned_count = count($page);
-            return [
+            $activeFilter = $filteredFromCache ? $newFilter : $cachedFilter;
+            // Key order matters: SecureChatAI caps oversized tool results by
+            // dropping trailing keys — preview_markdown/note MUST come before
+            // the (potentially huge) records payload or they get amputated.
+            $largeSetNote = $total > self::MAX_RECORDS_RETURNED
+                ? " LARGE RESULT SET ($total records) — rather than paging through all of them, suggest the user narrow their search with a more specific filter (pass reference + new filter to narrow in memory)."
+                : "";
+            $result = [
                 "pid" => $pid,
-                "filter" => $filter,
+                "filter" => $activeFilter,
                 "reference" => $reference,
-                "total_record_count" => count($ids),
+                "total_record_count" => $total,
                 "returned_count" => $returned_count,
                 "offset" => $offset,
                 "limit" => $limit,
-                "truncated" => ($offset + $returned_count) < count($ids),
-                "records" => $return_format === 'json' ? json_encode($page) : $page,
-                "note" => "Served from session cache (reference $reference).",
+                "truncated" => ($offset + $returned_count) < $total,
+                "preview_markdown" => $this->cappyBuildPreview($pid, $page, $activeFilter),
+                "note" => ($filteredFromCache
+                    ? "Filtered from the cached recordset in memory (no database re-query). Subset cached as $reference — pass it back with a new filter to narrow further, or with offset/limit to page. "
+                    : "Served from session cache (reference $reference). ")
+                    . "IMPORTANT: render 'preview_markdown' to the user VERBATIM as a markdown table — do not ask which fields to show, do not summarize instead of showing. Raw rows are withheld by default; pass include_records=true only if you need them for computation."
+                    . $largeSetNote,
+                "records" => $formatRecords($page),
             ];
+            return $result;
         }
 
         try {
@@ -305,53 +396,71 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
 
             $total_record_count = is_array($data) ? count($data) : 0;
 
-            // Large result: cache the full thing in PHP session and return a ref +
-            // a small preview. The LLM can call back with the ref to page through.
-            // Threshold = double the per-call cap (50) since showing 50 inline is fine.
-            if ($total_record_count > self::MAX_RECORDS_RETURNED * 2) {
-                $ref = $this->cappyCacheStore('records_search', [
-                    'pid' => $pid,
-                    'filter' => $filter,
-                    'ids' => $data,
-                ]);
-                $preview_ids = array_slice($data, 0, 10, true);
-                return [
-                    "pid" => $pid,
-                    "filter" => $filter,
-                    "total_record_count" => $total_record_count,
-                    "returned_count" => 0,
-                    "offset" => 0,
-                    "limit" => 10,
-                    "truncated" => true,
-                    "reference" => $ref,
-                    "preview" => $return_format === 'json' ? json_encode($preview_ids) : $preview_ids,
-                    "records" => [],
-                    "message" => "Result is large ($total_record_count records). Cached server-side in the PHP session. Use the 'reference' parameter to page through it: records.search(pid=$pid, reference=\"$ref\", offset=N, limit=M). The cache auto-expires after 10 minutes."
+            // Append mode: union the freshly-queried slice into the referenced
+            // cached recordset. Fresh rows win on duplicate record IDs.
+            $mergedFrom = null;
+            if ($appendBase !== null) {
+                $baseCount = count($appendBase['ids']);
+                $newCount = $total_record_count;
+                $data = array_replace($appendBase['ids'], is_array($data) ? $data : []);
+                $total_record_count = count($data);
+                $mergedFrom = [
+                    'base_count' => $baseCount,
+                    'new_count' => $newCount,
+                    'added_count' => $total_record_count - $baseCount,
+                    'base_filter' => $appendBase['filter'] ?? null,
                 ];
             }
+
+            // Always cache the full result set so follow-up questions can filter
+            // or page within it without another getData round trip.
+            $ref = $this->cappyCacheStore('records_search', [
+                'pid' => $pid,
+                'filter' => $mergedFrom
+                    ? "(" . ($mergedFrom['base_filter'] ?? '') . ") OR (" . ($filter ?? '') . ")"
+                    : $filter,
+                'ids' => $data,
+            ]);
 
             $page = is_array($data) ? array_slice($data, $offset, $limit, true) : [];
             $returned_count = count($page);
             $truncated = ($offset + $returned_count) < $total_record_count;
 
+            // Key order matters: SecureChatAI caps oversized tool results by
+            // dropping trailing keys — preview_markdown/note/message MUST come
+            // before the (potentially huge) records payload.
             $result = [
                 "pid" => $pid,
                 "filter" => $filter,
+                "reference" => $ref,
                 "total_record_count" => $total_record_count,
                 "returned_count" => $returned_count,
                 "offset" => $offset,
                 "limit" => $limit,
                 "truncated" => $truncated,
-                "records" => $return_format === 'json' ? json_encode($page) : $page
+                "preview_markdown" => $this->cappyBuildPreview($pid, $page, $filter),
+                "note" => ($mergedFrom
+                    ? "APPENDED to the cached working set: {$mergedFrom['new_count']} records matched the new filter, {$mergedFrom['added_count']} were new — merged set is now $total_record_count records (was {$mergedFrom['base_count']}), cached as \"$ref\". The accumulated set is what the user now means by 'the records' — narrow it with reference + new filter, or append more with append_to + new filter. "
+                    : "")
+                    . "IMPORTANT: render 'preview_markdown' to the user VERBATIM as a markdown table — do not ask which fields to show, do not summarize instead of showing. Raw rows are withheld by default; pass include_records=true only if you need them for computation. The full result set is cached as reference \"$ref\" — page with offset/limit (each page returns its own preview_markdown) or narrow with a new filter.",
+                 "records" => $formatRecords($page),
             ];
 
             if ($truncated) {
-                $result["message"] = "Showing $returned_count of $total_record_count matching records "
-                    . "(offset $offset). Do not try to list or summarize the full record set in chat — if the "
-                    . "user wants the complete record set, tell them to use Data Exports, Reports, and Stats "
-                    . "(left nav under Applications) instead, and offer to highlight that link with page.highlight "
-                    . "if page actions are available. Use offset/limit to page through results only if you need "
-                    . "more records for a specific analysis.";
+                // Insert BEFORE records — appended keys get amputated by the
+                // SecureChatAI result-size cap when records is large.
+                $pagingMsg = "Showing $returned_count of $total_record_count matching records "
+                    . "(offset $offset). The FULL result set is cached server-side as reference \"$ref\" "
+                    . "(expires in " . (self::CAPPY_CACHE_TTL / 60) . " minutes). For follow-up questions: "
+                    . "pass reference=\"$ref\" with a NEW 'filter' to narrow within this recordset without "
+                    . "re-querying the database, or pass reference + offset/limit to page through it."
+                    . ($total_record_count > self::MAX_RECORDS_RETURNED
+                        ? " LARGE RESULT SET ($total_record_count records) — rather than paging through all of them, suggest the user narrow their search with a more specific filter."
+                        : "");
+                $recordsVal = $result['records'];
+                unset($result['records']);
+                $result['message'] = $pagingMsg;
+                $result['records'] = $recordsVal;
             }
 
             return $result;
@@ -380,6 +489,11 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
 
         $pid = (int)$payload['pid'];
         $filter = $payload['filter'] ?? null;
+
+        if (!empty($filter)) {
+            $fieldError = $this->cappyValidateFilterFields($pid, $filter);
+            if ($fieldError !== null) return $fieldError;
+        }
 
         try {
             $data = \REDCap::getData(
@@ -816,6 +930,312 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
          }
      }
 
+    /**
+     * Validate that every [field] referenced in a REDCap logic filter exists
+     * in the project's data dictionary. Unknown fields silently evaluate to
+     * 0 matching records, which sends the agent guessing — fail loudly with
+     * fuzzy suggestions instead. Event names in [event][field] syntax are
+     * allowed through. Returns an error array, or null when all fields are OK.
+     */
+    private function cappyValidateFilterFields(int $pid, string $filter): ?array
+    {
+        $referenced = $this->cappyExtractFilterFields($filter);
+        if (empty($referenced)) return null;
+
+        try {
+            $dd = \REDCap::getDataDictionary($pid, 'array');
+            $valid = array_fill_keys(array_keys($dd), true);
+            // Unique event names are legal in [event][field] syntax
+            foreach ((array)\REDCap::getEventNames(true) as $uniqueName) {
+                $valid[$uniqueName] = true;
+            }
+        } catch (\Exception $e) {
+            return null; // can't validate — let the query run
+        }
+
+        $unknown = [];
+        foreach ($referenced as $f) {
+            if (!isset($valid[$f])) $unknown[] = $f;
+        }
+        if (empty($unknown)) return null;
+
+        // Fuzzy suggestions per unknown field
+        $allFields = array_keys($dd);
+        $suggestions = [];
+        foreach ($unknown as $f) {
+            $scored = [];
+            foreach ($allFields as $candidate) {
+                similar_text($f, $candidate, $pct);
+                if ($pct >= 40) $scored[$candidate] = $pct;
+            }
+            arsort($scored);
+            $suggestions[$f] = array_slice(array_keys($scored), 0, 3);
+        }
+
+        return [
+            "error" => true,
+            "message" => "Unknown field(s) in filter: " . implode(', ', $unknown)
+                . ". These fields do not exist in project $pid — the filter would silently match 0 records. "
+                . "Use the suggested fields below (or call projects.getMetadata to browse all fields).",
+            "unknown_fields" => $unknown,
+            "suggestions" => $suggestions,
+        ];
+    }
+
+    /**
+     * Flatten getData('array') output into a list of [record_id, fields] rows —
+     * one per event row AND one per repeating-instrument instance. Without
+     * this, projects whose data lives on repeating forms (like PIVIE phase 2)
+     * produce empty previews: the base event row is empty and everything real
+     * is under 'repeat_instances'.
+     */
+    private function cappyFlattenRows(array $data): array
+    {
+        $rows = [];
+        foreach ($data as $rid => $events) {
+            if (!is_array($events)) continue;
+            $recordHasData = false;
+            $recordRows = [];
+            foreach ($events as $eventId => $eventData) {
+                if ($eventId === 'repeat_instances' || !is_array($eventData)) continue;
+                $recordRows[] = [$rid, $eventData];
+            }
+            if (isset($events['repeat_instances']) && is_array($events['repeat_instances'])) {
+                foreach ($events['repeat_instances'] as $eventId => $instruments) {
+                    if (!is_array($instruments)) continue;
+                    foreach ($instruments as $instrument => $instances) {
+                        if (!is_array($instances)) continue;
+                        foreach ($instances as $instance => $fields) {
+                            if (!is_array($fields)) continue;
+                            $recordRows[] = [$rid, $fields];
+                        }
+                    }
+                }
+            }
+            // Drop rows that are entirely empty UNLESS they're the record's only row
+            $nonEmpty = array_filter($recordRows, function ($r) {
+                foreach ($r[1] as $v) {
+                    if (is_array($v)) { if (array_filter($v, fn($x) => $x !== '' && $x !== null)) return true; }
+                    elseif ($v !== '' && $v !== null) return true;
+                }
+                return false;
+            });
+            $rows = array_merge($rows, !empty($nonEmpty) ? array_values($nonEmpty) : $recordRows);
+        }
+        return $rows;
+    }
+
+    /**
+     * Build a ready-to-render markdown preview table from a page of getData
+     * rows. The LLM is instructed to echo this verbatim — eliminates the
+     * "would you like to see the records?" dance when records are wide.
+     *
+     * Rows: one per record instance (repeating instruments flattened).
+     * Columns: record_id + fields referenced in the filter + the fields with
+     * the most non-empty values in the sample (checkbox arrays and form
+     * status fields excluded), capped at $maxCols. Rows capped at $maxRows.
+     */
+    private function cappyBuildPreview(int $pid, array $page, ?string $filter, int $maxRows = 20, int $maxCols = 8): string
+    {
+        if (empty($page)) return '';
+        $recordIdField = \REDCap::getRecordIdField($pid);
+
+        $rows = $this->cappyFlattenRows($page);
+        if (empty($rows)) return '';
+
+        // Column selection
+        $cols = [$recordIdField];
+        foreach ($this->cappyExtractFilterFields($filter ?? '') as $f) {
+            if ($f === $recordIdField || in_array($f, $cols)) continue;
+            foreach ($rows as [, $fields]) {
+                if (array_key_exists($f, $fields) && !is_array($fields[$f])) { $cols[] = $f; break; }
+            }
+        }
+        // Rank remaining scalar fields by non-empty count across the sample
+        $scores = [];
+        foreach (array_slice($rows, 0, 50) as [, $fields]) {
+            foreach ($fields as $field => $val) {
+                if (is_array($val) || in_array($field, $cols)) continue;
+                if (strpos($field, '___') !== false || substr($field, -9) === '_complete') continue;
+                if (!isset($scores[$field])) $scores[$field] = 0;
+                if ($val !== '' && $val !== null) $scores[$field]++;
+            }
+        }
+        arsort($scores);
+        foreach ($scores as $field => $n) {
+            if (count($cols) >= $maxCols) break;
+            if ($n === 0) break; // never add all-empty columns
+            $cols[] = $field;
+        }
+
+        // Fetch metadata for the chosen columns so coded fields render as
+        // LABELS ("Female") instead of raw codes ("2") — otherwise the LLM
+        // does its own code→label translation and gets it wrong.
+        $meta = [];
+        try {
+            $dd = \REDCap::getDataDictionary($pid, 'array', false, $cols);
+            foreach ($dd as $fname => $info) {
+                $type = $info['field_type'] ?? '';
+                if (in_array($type, ['radio', 'select', 'dropdown', 'checkbox', 'yesno', 'truefalse'], true)) {
+                    $enum = $info['select_choices_or_calculations'] ?? '';
+                    $meta[$fname] = $enum !== '' ? parseEnum($enum) : [];
+                    if ($type === 'yesno') $meta[$fname] = ['1' => 'Yes', '0' => 'No'];
+                    if ($type === 'truefalse') $meta[$fname] = ['1' => 'True', '0' => 'False'];
+                }
+            }
+        } catch (\Exception $e) {
+            $meta = []; // labels are best-effort; raw values on failure
+        }
+
+        $esc = fn($v) => str_replace(["|", "\n", "\r"], ['\|', ' ', ' '], trim((string)$v));
+        $label = function ($field, $val) use ($meta, $esc) {
+            // Checkbox values arrive as arrays of code => '0'/'1' — render the checked labels
+            if (is_array($val)) {
+                $checked = [];
+                foreach ($val as $code => $flag) {
+                    if ((string)$flag !== '' && (string)$flag !== '0') {
+                        $checked[] = $meta[$field][$code] ?? $code;
+                    }
+                }
+                return $esc(implode(', ', $checked));
+            }
+            $val = trim((string)$val);
+            if ($val === '') return '';
+            if (isset($meta[$field]) && array_key_exists($val, $meta[$field])) {
+                return $esc($meta[$field][$val]);
+            }
+            return $esc($val);
+        };
+        $out = '| ' . implode(' | ', $cols) . " |\n";
+        $out .= '| ' . implode(' | ', array_fill(0, count($cols), '---')) . " |\n";
+        foreach (array_slice($rows, 0, $maxRows) as [$rid, $fields]) {
+            $cells = [];
+            foreach ($cols as $c) {
+                $cells[] = $c === $recordIdField ? $esc($rid) : $label($c, $fields[$c] ?? '');
+            }
+            $out .= '| ' . implode(' | ', $cells) . " |\n";
+        }
+        return $out;
+    }
+
+    /**
+     * Extract bare field names referenced in a REDCap logic filter.
+     */
+    private function cappyExtractFilterFields(string $filter): array
+    {
+        $fields = [];
+        if (preg_match_all('/\[([^\[\]]+)\]/', $filter, $m)) {
+            foreach ($m[1] as $token) {
+                $token = preg_replace('/[:(\[].*$/', '', $token);
+                if (strpos($token, '.') !== false) {
+                    $parts = explode('.', $token);
+                    $token = end($parts);
+                }
+                $token = trim($token);
+                if ($token !== '' && preg_match('/^[a-zA-Z][a-zA-Z0-9_]*$/', $token)) {
+                    $fields[$token] = true;
+                }
+            }
+        }
+        return array_keys($fields);
+    }
+
+    /**
+     * Apply a NEW REDCap logic filter against a cached recordset in memory —
+     * no getData round trip. Uses REDCap::evaluateLogic with the cached row
+     * passed in as $record_data.
+     *
+     * If the filter references fields that aren't present in the cached rows
+     * (e.g. the original search used a narrow 'fields' list), falls back to a
+     * single getData scoped to the cached record IDs (still avoids a
+     * full-project scan).
+     *
+     * @param int    $pid
+     * @param array  $data   Cached getData('array') result: [record => [event => [field => value]]]
+     * @param string $filter REDCap logic expression
+     * @return array Filtered subset, same shape as $data
+     */
+    private function cappyFilterCachedRecords(int $pid, array $data, string $filter): array
+    {
+        if (empty($data) || trim($filter) === '') {
+            return $data;
+        }
+
+        // Collect field names referenced by the filter: [field], [event][field],
+        // [field:value], [field(code)] — normalize to bare field names.
+        $referenced = array_fill_keys($this->cappyExtractFilterFields($filter), true);
+
+        // Check the cached rows actually contain every referenced field.
+        // Collect from base event rows AND repeating-instance rows.
+        $available = [];
+        foreach (array_slice($this->cappyFlattenRows($data), 0, 5) as [, $fields]) {
+            foreach (array_keys($fields) as $fieldName) {
+                $available[$fieldName] = true;
+            }
+        }
+        $missing = array_diff_key($referenced, $available);
+
+        if (!empty($missing)) {
+            // Fallback: scoped getData limited to the cached record IDs.
+            $this->emDebug("cappyFilterCachedRecords: fields missing from cache, scoped re-query", [
+                'pid' => $pid,
+                'missing_fields' => array_keys($missing),
+            ]);
+            $scoped = \REDCap::getData(
+                $pid,
+                'array',
+                array_keys($data), // only records in the cached set
+                null, null, null, false, false, false,
+                $filter
+            );
+            return is_array($scoped) ? $scoped : [];
+        }
+
+        // Large-set guard: REDCap::evaluateLogic constructs a Project object
+        // per call — fine for a few dozen records, object churn for hundreds.
+        // Past the threshold, one scoped getData (single SQL query limited to
+        // the cached record IDs) beats N per-record evaluations.
+        if (count($data) > self::CAPPY_FILTER_INLINE_MAX) {
+            $this->emDebug("cappyFilterCachedRecords: set too large for in-memory filter, scoped re-query", [
+                'pid' => $pid,
+                'cached_count' => count($data),
+            ]);
+            $scoped = \REDCap::getData(
+                $pid,
+                'array',
+                array_keys($data), // only records in the cached set
+                null, null, null, false, false, false,
+                $filter
+            );
+            return is_array($scoped) ? $scoped : [];
+        }
+
+        // In-memory path: evaluate the logic per record against the cached row.
+        $subset = [];
+        foreach ($data as $recordId => $row) {
+            try {
+                $res = \REDCap::evaluateLogic(
+                    $filter,
+                    $pid,
+                    $recordId,
+                    null,           // event_name
+                    1,              // repeat_instance
+                    '',             // repeat_instrument
+                    '',             // current_context_instrument
+                    [$recordId => $row], // record_data — inline, no DB hit
+                    false,          // returnValue
+                    false           // checkRecordExists (skip DB existence check)
+                );
+                if ($res === true) {
+                    $subset[$recordId] = $row;
+                }
+            } catch (\Exception $e) {
+                $this->emError("cappyFilterCachedRecords: evaluateLogic failed for record $recordId in pid $pid: " . $e->getMessage());
+            }
+        }
+        return $subset;
+    }
+
     // -----------------------------------------------------------------
     // Session cache for large tool results. The LLM gets a short reference
     // id; the full data lives in $_SESSION for the lifetime of the session
@@ -825,8 +1245,13 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
     // plan.
     // -----------------------------------------------------------------
 
-    /** TTL for cached tool results, in seconds. */
-    const CAPPY_CACHE_TTL = 600;
+    /** TTL for cached tool results, in seconds. 30 min — long enough for a
+     *  multi-turn analysis conversation to keep reusing the same recordset. */
+    const CAPPY_CACHE_TTL = 1800;
+
+    /** Max records to filter in memory via per-record evaluateLogic. Past
+     *  this, the per-call Project construction outweighs one scoped query. */
+    const CAPPY_FILTER_INLINE_MAX = 200;
 
     /**
      * Stash $payload in the PHP session under a short random reference id
@@ -847,6 +1272,7 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
         }
         $ref = 'ref_' . bin2hex(random_bytes(4));
         $_SESSION['cappy_data_cache'][$ref] = [
+            'tool' => $key,
             'data' => $payload,
             'expires_at' => $now + self::CAPPY_CACHE_TTL,
             'stored_at' => $now,
@@ -855,7 +1281,8 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
     }
 
     /**
-     * Fetch a cached payload by reference. Returns null if missing or expired.
+     * Fetch a cached payload by reference. Returns null if missing, expired,
+     * or (when $expectedKey is given) cached by a different tool.
      */
     private function cappyCacheFetch(string $ref, ?string $expectedKey = null)
     {
@@ -865,6 +1292,9 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
         $entry = $_SESSION['cappy_data_cache'][$ref];
         if (($entry['expires_at'] ?? 0) < time()) {
             unset($_SESSION['cappy_data_cache'][$ref]);
+            return null;
+        }
+        if ($expectedKey !== null && ($entry['tool'] ?? null) !== $expectedKey) {
             return null;
         }
         return $entry['data'];

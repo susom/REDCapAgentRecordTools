@@ -210,30 +210,42 @@ Retrieve a specific record by its record ID.
 
 **Action:** `records_search`
 
-Search records with an optional REDCap logic filter expression.
+Search records with an optional REDCap logic filter expression. **Every** result set (any size, filtered or not) is cached in the PHP session (30-min TTL, `$_SESSION['cappy_data_cache']`) and identified by a `ref_xxx` handle, enabling accumulation, narrowing, and no-LLM pagination across turns.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `pid` | integer | ✅ | REDCap project ID |
 | `filter` | string | | REDCap logic expression, e.g. `[age] > 18` |
 | `fields` | string[] | | Fields to include in results |
+| `reference` | string | | Prior `ref_xxx` — combined with `filter`, narrows that cached set **in memory** (no DB query) |
+| `append_to` | string | | Prior `ref_xxx` — the new result set is **unioned** into it (accumulating working set) |
+| `include_records` | boolean | | `true` to include raw rows in the response (default `false` — large sets flood LLM context) |
+| `limit` / `offset` | integer | | Pagination of the raw `records` slice (default limit 1000; server-side preview is always 20 rows) |
 | `return_format` | string | | `"array"` (default) or `"json"` |
 
 ```json
 // Request
 {"pid": 42, "filter": "[baseline_complete] = '2' AND [age] >= 18"}
 
-// Response
+// Response (key order matters: SecureChatAI truncates tool results at 8000 chars, dropping trailing keys)
 {
   "pid": 42,
   "filter": "[baseline_complete] = '2' AND [age] >= 18",
+  "total": 23,
   "record_count": 23,
-  "records": {
-    "1001": {"age": "34", "baseline_complete": "2"},
-    "1002": {"age": "28", "baseline_complete": "2"}
-  }
+  "reference": "ref_a1b2c3d4e5f6",
+  "preview_markdown": "| record_id | age | sex |\n|---|---|---|\n| 1001 | 34 | Female |...",
+  "note": "...",
+  "records": { "1001": {"age": "34", "baseline_complete": "2"} }  // only when include_records=true or small
 }
 ```
+
+**Working-set semantics (for the LLM):**
+- `reference` + new `filter` → narrows the cached set; result chains under a **new** reference. >200 records falls back to one scoped DB query (per-record `evaluateLogic` constructs a Project object each call).
+- `append_to` + new `filter` → fresh query for the new filter, union-merged into the cached set in place.
+- Unknown `filter` field names are validated against the data dictionary and hard-error with fuzzy suggestions.
+
+**`preview_markdown`** is server-built: 20 rows × ≤8 smart columns (record ID + filter fields + most-populated), repeating-instrument instances flattened into real rows, checkbox fields rendered as checked labels, and **choice codes resolved to display labels** (never trust the LLM to translate codes — it gets codebook mappings wrong).
 
 ---
 

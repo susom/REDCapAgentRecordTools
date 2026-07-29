@@ -17,7 +17,7 @@
 		},
 		{
 			"name": "projects.getMetadata",
-			"description": "Get the data dictionary (field definitions) for a REDCap project. Returns field names, types, labels, validation, choices, and branching logic. Use this to understand a project's structure before reading or writing records.",
+			"description": "Get the data dictionary (field definitions) for a REDCap project. Returns field names, types, labels, validation, choices, and branching logic. Use this to understand a project's structure before reading or writing records. PROACTIVE USE: when the user describes a concept in natural language ('severity', 'consented', 'enrolled', 'site'), call this tool FIRST and read each candidate's field_label to pick the right field yourself — do NOT ask the user to name the field for you. That is your job. Only ask the user to disambiguate when the top 2 labels are both plausible for their wording AND a wrong pick would be hard to recover from.",
 			"action": "projects_getMetadata",
 			"parameters": {
 				"type": "object",
@@ -63,7 +63,7 @@
 		},
 {
       "name": "records.search",
-      "description": "Search records in a REDCap project with an optional REDCap logic filter expression. Returns: total_record_count, a 'reference' id (the FULL result set, cached server-side in the PHP session), and 'preview_markdown' — a ready-made markdown table of the first 20 rows with sensible columns. ALWAYS render preview_markdown verbatim to the user; never ask which fields to show. Raw record rows are withheld by default (keeps context small) — pass include_records=true with a modest limit only when you need raw values for computation. For follow-up questions about the same data, DO NOT start a new search: pass the 'reference' back with a NEW 'filter' to narrow the cached recordset in memory (no database round trip), or with offset/limit to page (each page returns its own preview_markdown). When the user wants to ACCUMULATE ('also add severity 4', 'include those too'), use 'append_to' with the new filter — only the new slice is queried, then merged into the working set. Use REDCap logic syntax for filters, e.g. '[age] > 18'. For pure counts, prefer records.count; for ID-only enumeration, prefer records.listIds.",
+      "description": "Search records in a REDCap project with an optional REDCap logic filter expression. Returns: total_record_count, a 'reference' id (the FULL result set, cached server-side in the PHP session), and 'preview_markdown' — a ready-made markdown table of the first 20 rows with sensible columns. ALWAYS render preview_markdown verbatim to the user; never ask which fields to show. Raw record rows are withheld by default (keeps context small) — pass include_records=true with a modest limit only when you need raw values for computation. For follow-up questions about the same data, DO NOT start a new search: pass the 'reference' back with a NEW 'filter' to narrow the cached recordset in memory (no database round trip), or with offset/limit to page (each page returns its own preview_markdown). When the user wants to ACCUMULATE ('also add severity 4', 'include those too'), use 'append_to' with the new filter — only the new slice is queried, then merged into the working set. Use REDCap logic syntax for filters, e.g. '[age] > 18'. For pure counts, prefer records.count; for ID-only enumeration, prefer records.listIds. LITERAL AUTO-TRANSLATION: choice labels in your filter (e.g. [d_legal_sex] = \"Female\") are auto-expanded server-side to OR with the underlying code, so label and code paths both work. When the response includes a 'filter_translations' array, mention briefly to the user what you wrote and what the tool auto-translated (e.g. \"I wrote d_legal_sex = 'Female', which the tool expanded to also match code 2\"). PROACTIVE FIELD RESOLUTION: if you're not sure which field captures the user's concept, call projects.getMetadata first and pick the field whose field_label matches the user's words. Don't ask the user to name the field for you. UNKNOWN FIELDS: if the filter references fields that don't exist, the response includes a 'suggestions' map keyed by the unknown field name. Each value has a 'best_match' (field name), 'best_label' (its human label), and 'candidates' (up to 3 ranked by combined name+label similarity). Use best_match UNLESS best_label clearly doesn't fit the user's wording — in which case pick from candidates by label. Re-run with the chosen field; tell the user what you substituted and why.",
       "action": "records_search",
       "parameters": {
         "type": "object",
@@ -75,7 +75,7 @@
           "fields": {"type": "array", "items": {"type": "string"}, "description": "Optional list of specific field names to include in results. Omit to get all fields — recommended, so follow-up filters on any field can be served from cache."},
           "return_format": {"type": "string", "enum": ["array", "json"], "description": "Response format for raw rows (only used when include_records=true)", "default": "array"},
           "include_records": {"type": "boolean", "description": "If true, include raw record rows in the response. Default false — preview_markdown + reference are usually all you need.", "default": false},
-          "limit": {"type": "integer", "description": "Max records to return in this call (uncapped — the full result set is cached server-side regardless). Defaults to 1000. If total_record_count exceeds ~1000, suggest the user narrow their filter instead of paging through everything.", "default": 1000},
+          "limit": {"type": "integer", "description": "Max records to return in this call (uncapped — the full result set is cached server-side regardless). Defaults to 500. If total_record_count exceeds ~500, suggest the user narrow their filter or use records.aggregate for whole-dataset questions.", "default": 500},
           "offset": {"type": "integer", "description": "Number of matching records to skip, for paging through results beyond the per-call cap.", "default": 0}
         },
         "required": ["pid"]
@@ -83,9 +83,9 @@
       "readOnly": true,
       "destructive": false
     },
-    {
-      "name": "records.count",
-      "description": "Return the number of records in a REDCap project matching an optional REDCap logic filter. No record data is returned — only the count. Cheap alternative to records.search when the user only wants a count (e.g. 'how many records are there?', 'how many consented?').",
+		{
+			"name": "records.count",
+			"description": "Return the number of records in a REDCap project matching an optional REDCap logic filter. No record data is returned — only the count. Cheap alternative to records.search when the user only wants a count (e.g. 'how many records are there?', 'how many consented?'). LITERAL AUTO-TRANSLATION: choice labels in your filter (e.g. [d_legal_sex] = \"Female\") are auto-expanded server-side to OR with the underlying code, so label and code paths both work. When the response includes a 'filter_translations' array, mention briefly to the user what you wrote and what the tool auto-translated. PROACTIVE FIELD RESOLUTION: if you're not sure which field captures the user's concept, call projects.getMetadata first and pick the field whose field_label matches the user's words. Don't ask the user to name the field for you. UNKNOWN FIELDS: if the filter references fields that don't exist, the response includes a 'suggestions' map keyed by the unknown field name. Each value has a 'best_match' (field name), 'best_label' (its human label), and 'candidates' (up to 3 ranked by combined name+label similarity). Use best_match UNLESS best_label clearly doesn't fit the user's wording — in which case pick from candidates by label. Re-run with the chosen field; tell the user what you substituted and why.",
       "action": "records_count",
       "parameters": {
         "type": "object",
@@ -98,6 +98,24 @@
       "readOnly": true,
       "destructive": false
     },
+		{
+			"name": "records.aggregate",
+			"description": "Compute a single aggregate statistic over one field, optionally filtered. Returns just the result — no raw rows. Use this for questions like 'what's the median X across all records', 'most common Y', 'average age' instead of fetching every row. Functions: count, sum, mean, median, mode, min, max, stddev. For radio/choice fields the stored code is used numerically; value_label in the response resolves the result back to its human label. By default, mean/sum/stddev are only allowed on numeric-scale fields (text, calc, slider, or radio/dropdown with numeric labels like '1, 2, 3, 4, 5+'). For ordinal categorical radio fields (severity, etc.), only count/mode/median/min/max are allowed. Pass treat_as_numeric=true ONLY when you've verified the codes form a meaningful numeric scale (e.g. catheter gauge sizes 1-10); never use it as a workaround for an error. Filter literal auto-translation works the same as records.search (e.g. [d_legal_sex] = \"Female\" → also matches code 2). PROACTIVE FIELD RESOLUTION: if you're not sure which field captures the user's concept, call projects.getMetadata first and pick the field whose field_label matches the user's words. NEVER guess a field name — unknown fields return errors with close-match suggestions, and you should pick best_match by label rather than retry. If the user asks for a statistic you cannot honor (wrong function for the field type, unknown field, ambiguous concept), explain the constraint and ask the user to clarify rather than inventing an answer. For pure counts prefer records.count; for ID-only enumeration prefer records.listIds.",
+			"action": "records_aggregate",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"pid": {"type": "integer", "description": "REDCap project ID"},
+					"field": {"type": "string", "description": "The single field to aggregate over (e.g. 'p2_cath_size', 'age')."},
+					"function": {"type": "string", "enum": ["count", "sum", "mean", "median", "mode", "min", "max", "stddev"], "description": "Aggregate function to compute."},
+					"filter": {"type": "string", "description": "Optional REDCap logic filter to narrow the dataset before aggregating, e.g. '[d_legal_sex] = \"Female\"'."},
+					"treat_as_numeric": {"type": "boolean", "description": "Set true to force numeric aggregations (sum/mean/stddev) on a radio/dropdown field regardless of whether its labels are numeric. Use when you've verified the codes form a meaningful numeric scale (e.g. catheter gauge sizes 1-10). Default false.", "default": false}
+				},
+				"required": ["pid", "field", "function"]
+			},
+			"readOnly": true,
+			"destructive": false
+		},
 		{
 			"name": "records.listIds",
 			"description": "Return just the record IDs in a REDCap project (no field data). PREFER THIS TOOL over records.search when the user asks for record IDs only, a count of records, or a specific range of record IDs — it returns the same data with much less context cost. Use records.search only when the user wants field values too. Supports the same filter as records.count/records.search. When more than 50 IDs match, the full list is cached server-side in the PHP session and a short reference id is returned; pass that reference back to retrieve a page.",

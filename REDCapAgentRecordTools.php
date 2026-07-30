@@ -1464,11 +1464,18 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
      * automatic DAG scoping and compute aggregates over records the caller
      * cannot view. Projects with DAGs fall back to the (slower) getData path.
      */
+    /**
+     * Return true when the project has Data Access Groups configured. Used to
+     * gate the SQL fast path — direct SQL would skip REDCap::getData's
+     * automatic DAG scoping and compute aggregates over records the caller
+     * cannot view. Projects with DAGs fall back to the (slower) getData path.
+     */
     private function cappyProjectHasDAGs(int $pid): bool
     {
         try {
             $q = db_query(
-                "SELECT COUNT(*) AS c FROM redcap_data_access_groups WHERE project_id = " . (int)$pid
+                "SELECT COUNT(*) AS c FROM redcap_data_access_groups WHERE project_id = ?",
+                [(int)$pid]
             );
             if (!$q) return false;
             $row = db_fetch_assoc($q);
@@ -1482,13 +1489,18 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
     }
 
     /**
-     * Fast-path aggregate over redcap_data via direct SQL. Skips REDCap::getData
-     * (which loads full row objects and runs through PHI / DAG / branching
-     * hooks) — for simple "across the whole dataset" stats this is ~50-100x
-     * faster on projects with 1000+ records.
+     * Fast-path aggregate over the project's data table via direct SQL.
      *
-     * Caller MUST already have filtered to non-checkbox fields with no REDCap
-     * logic filter (we don't translate the logic expression here).
+     * Skips REDCap::getData (which loads full row objects and runs through
+     * PHI / DAG / branching hooks) — for simple "across the whole dataset"
+     * stats this is ~50-100x faster on projects with 1000+ records.
+     *
+     * Caller MUST already have gated to non-checkbox fields with no REDCap
+     * logic filter (we don't translate the logic expression here) and
+     * confirmed the project has no DAGs (via cappyProjectHasDAGs).
+     *
+     * All queries use bound parameters — nothing is interpolated into SQL.
+     * Table name comes from REDCap's \Records::getDataTable() whitelist.
      *
      * Returns:
      *   [
@@ -1511,11 +1523,13 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             // REDCap moves large projects to per-project tables (redcap_dataN).
             // \Records::getDataTable returns the right one for this project.
             $table = \Records::getDataTable((int)$pid);
-            $pidI  = (int)$pid;
-            $fieldE = db_real_escape_string($field);
+            $pidI = (int)$pid;
+            $fieldE = (string)$field;
 
-            // One query for everything we can compute in SQL: count + sum/mean/
-            // min/max/stddev over numeric values. Empty strings excluded.
+            // Numeric aggregates in one query: count + sum/mean/min/max/stddev.
+            // CAST(value AS DECIMAL(20,6)) coerces REDCap's text storage to a
+            // numeric type; non-numeric strings evaluate to 0 (acceptable —
+            // they're data-entry errors the user already sees as warnings).
             $aggSql = "SELECT
                         COUNT(*)                                  AS n,
                         COUNT(DISTINCT record)                    AS record_count,
@@ -1525,10 +1539,10 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                         MAX(CAST(value AS DECIMAL(20,6)))         AS mx,
                         STDDEV_SAMP(CAST(value AS DECIMAL(20,6))) AS sd
                     FROM {$table}
-                    WHERE project_id = {$pidI}
-                      AND field_name = '{$fieldE}'
+                    WHERE project_id = ?
+                      AND field_name = ?
                       AND value != ''";
-            $q = db_query($aggSql);
+            $q = db_query($aggSql, [$pidI, $fieldE]);
             if (!$q) return null;
             $row = db_fetch_assoc($q);
             if (!$row) return null;
@@ -1553,11 +1567,11 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 // MySQL has no MEDIAN(). Pull the sorted values once.
                 $valSql = "SELECT CAST(value AS DECIMAL(20,6)) AS v
                            FROM {$table}
-                           WHERE project_id = {$pidI}
-                             AND field_name = '{$fieldE}'
+                           WHERE project_id = ?
+                             AND field_name = ?
                              AND value != ''
                            ORDER BY v";
-                $vq = db_query($valSql);
+                $vq = db_query($valSql, [$pidI, $fieldE]);
                 if (!$vq) return null;
                 $vals = [];
                 while ($vr = db_fetch_assoc($vq)) {
@@ -1570,13 +1584,13 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             } elseif ($function === 'mode') {
                 $modeSql = "SELECT value, COUNT(*) AS c
                             FROM {$table}
-                            WHERE project_id = {$pidI}
-                              AND field_name = '{$fieldE}'
+                            WHERE project_id = ?
+                              AND field_name = ?
                               AND value != ''
                             GROUP BY value
                             ORDER BY c DESC, value ASC
                             LIMIT 1";
-                $mq = db_query($modeSql);
+                $mq = db_query($modeSql, [$pidI, $fieldE]);
                 if (!$mq) return null;
                 $mr = db_fetch_assoc($mq);
                 if (!$mr) return null;

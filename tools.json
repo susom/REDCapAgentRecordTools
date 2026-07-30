@@ -84,24 +84,6 @@
       "destructive": false
     },
 		{
-			"name": "records.aggregate",
-			"description": "Compute a single aggregate statistic over one field, optionally filtered. Returns just the result — no raw rows. Use this for questions like 'what's the median X across all records', 'most common Y', 'average age' instead of fetching every row. Functions: count, sum, mean, median, mode, min, max, stddev. For radio/choice fields the stored code is used numerically; value_label in the response resolves the result back to its human label. By default, mean/sum/stddev are only allowed on numeric-scale fields (text, calc, slider, or radio/dropdown with numeric labels like '1, 2, 3, 4, 5+'). For ordinal categorical radio fields (severity, etc.), only count/mode/median/min/max are allowed. Pass treat_as_numeric=true ONLY when you've verified the codes form a meaningful numeric scale (e.g. catheter gauge sizes 1-10); never use it as a workaround for an error. Filter literal auto-translation works the same as records.search (e.g. [d_legal_sex] = \"Female\" → also matches code 2). PROACTIVE FIELD RESOLUTION: if you're not sure which field captures the user's concept, call projects.getMetadata first and pick the field whose field_label matches the user's words. NEVER guess a field name — unknown fields return errors with close-match suggestions, and you should pick best_match by label rather than retry. If the user asks for a statistic you cannot honor (wrong function for the field type, unknown field, ambiguous concept), explain the constraint and ask the user to clarify rather than inventing an answer. For pure counts prefer records.count; for ID-only enumeration prefer records.listIds.",
-			"action": "records_aggregate",
-			"parameters": {
-				"type": "object",
-				"properties": {
-					"pid": {"type": "integer", "description": "REDCap project ID"},
-					"field": {"type": "string", "description": "The single field to aggregate over (e.g. 'p2_cath_size', 'age')."},
-					"function": {"type": "string", "enum": ["count", "sum", "mean", "median", "mode", "min", "max", "stddev"], "description": "Aggregate function to compute."},
-					"filter": {"type": "string", "description": "Optional REDCap logic filter to narrow the dataset before aggregating, e.g. '[d_legal_sex] = \"Female\"'."},
-					"treat_as_numeric": {"type": "boolean", "description": "Set true to force numeric aggregations (sum/mean/stddev) on a radio/dropdown field regardless of whether its labels are numeric. Use when you've verified the codes form a meaningful numeric scale (e.g. catheter gauge sizes 1-10). Default false.", "default": false}
-				},
-				"required": ["pid", "field", "function"]
-			},
-			"readOnly": true,
-			"destructive": false
-		},
-		{
 			"name": "records.listIds",
 			"description": "Return just the record IDs in a REDCap project (no field data). PREFER THIS TOOL over records.search when the user asks for record IDs only, a count of records, or a specific range of record IDs — it returns the same data with much less context cost. Use records.search only when the user wants field values too. Supports the same filter as records.count/records.search. When more than 50 IDs match, the full list is cached server-side in the PHP session and a short reference id is returned; pass that reference back to retrieve a page.",
 			"action": "records_listIds",

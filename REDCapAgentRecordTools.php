@@ -1148,17 +1148,40 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
         // Fetch metadata for the chosen columns so coded fields render as
         // LABELS ("Female") instead of raw codes ("2") — otherwise the LLM
         // does its own code→label translation and gets it wrong.
+        //
+        // REDCap's parseEnum() only splits on "\n" (legacy separator); modern
+        // deployments store enums with "|" separators, which makes parseEnum
+        // treat the whole string as one option. We parse both formats here.
         $meta = [];
         try {
             $dd = \REDCap::getDataDictionary($pid, 'array', false, $cols);
             foreach ($dd as $fname => $info) {
                 $type = $info['field_type'] ?? '';
-                if (in_array($type, ['radio', 'select', 'dropdown', 'checkbox', 'yesno', 'truefalse'], true)) {
-                    $enum = $info['select_choices_or_calculations'] ?? '';
-                    $meta[$fname] = $enum !== '' ? parseEnum($enum) : [];
-                    if ($type === 'yesno') $meta[$fname] = ['1' => 'Yes', '0' => 'No'];
-                    if ($type === 'truefalse') $meta[$fname] = ['1' => 'True', '0' => 'False'];
+                if (!in_array($type, ['radio', 'select', 'dropdown', 'checkbox', 'yesno', 'truefalse'], true)) {
+                    continue;
                 }
+                if ($type === 'yesno') {
+                    $meta[$fname] = ['1' => 'Yes', '0' => 'No'];
+                    continue;
+                }
+                if ($type === 'truefalse') {
+                    $meta[$fname] = ['1' => 'True', '0' => 'False'];
+                    continue;
+                }
+                $enum = (string)($info['select_choices_or_calculations'] ?? '');
+                if ($enum === '') continue;
+                // Split on either pipe or literal "\n" — see cappyBuildLabelMap.
+                $pairs = [];
+                foreach (preg_split('/\\\\n|\|/', $enum) as $opt) {
+                    $opt = trim(preg_replace('/\s+/', ' ', $opt));
+                    if ($opt === '' || strpos($opt, ',') === false) continue;
+                    [$code, $label] = explode(',', $opt, 2);
+                    $code  = trim($code);
+                    $label = trim($label);
+                    if ($code === '' || $label === '') continue;
+                    $pairs[$code] = $label;
+                }
+                $meta[$fname] = $pairs;
             }
         } catch (\Exception $e) {
             $meta = []; // labels are best-effort; raw values on failure

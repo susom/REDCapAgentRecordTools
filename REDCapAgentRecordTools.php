@@ -1266,7 +1266,12 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             // Skip fast path for checkbox (checkbox codes live as field___N in
             // redcap_data and need the getData array form) and for any filter
             // (we don't translate REDCap logic to SQL — getData does it correctly).
-            $useFastPath = empty($filter) && $fieldType !== 'checkbox';
+            // Also skip when the project has Data Access Groups — direct SQL
+            // would compute aggregates over records the caller cannot view,
+            // bypassing REDCap::getData's automatic DAG scoping.
+            $useFastPath = empty($filter)
+                && $fieldType !== 'checkbox'
+                && !$this->cappyProjectHasDAGs($pid);
             $n = 0;
             $recordCount = 0;
             $values = null; // only used by slow path
@@ -1427,6 +1432,29 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             }
         }
         return $numeric >= max(1, (int)ceil(count($labels) / 2));
+    }
+
+    /**
+     * Return true when the project has Data Access Groups configured. Used to
+     * gate the SQL fast path — direct SQL would skip REDCap::getData's
+     * automatic DAG scoping and compute aggregates over records the caller
+     * cannot view. Projects with DAGs fall back to the (slower) getData path.
+     */
+    private function cappyProjectHasDAGs(int $pid): bool
+    {
+        try {
+            $q = db_query(
+                "SELECT COUNT(*) AS c FROM redcap_data_access_groups WHERE project_id = " . (int)$pid
+            );
+            if (!$q) return false;
+            $row = db_fetch_assoc($q);
+            return (int)($row['c'] ?? 0) > 0;
+        } catch (\Exception $e) {
+            // Fail-closed: if we can't determine, assume DAGs may exist and
+            // use the slow path so REDCap's own scoping applies.
+            $this->emError("cappyProjectHasDAGs failed for pid={$pid}: " . $e->getMessage());
+            return true;
+        }
     }
 
     /**

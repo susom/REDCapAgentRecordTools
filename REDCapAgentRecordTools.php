@@ -28,21 +28,43 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
      *   getModuleInstance($prefix)->redcap_module_api($action, $payload)
      * Also callable externally via the REDCap API:
      *   POST /api/ ... content=externalModule&prefix=...&action=...
+     *
+     * ⚠️  SECURITY — KNOWN CRITICAL ISSUE (deferred):
+     * This endpoint performs ZERO authorization. Any REDCap API token
+     * (or EM-to-EM call from a compromised context) can invoke any action
+     * with any pid, regardless of whether the caller has rights to that
+     * project. Today the risk surface is contained because:
+     *   1. This EM is not exposed via the public REDCap API
+     *      (auth-ajax-actions in config.json is empty), and
+     *   2. The chatbot EM's CappyScopePreHook enforces pid scope inside
+     *      SecureChatAI's agent loop.
+     * Neither of these is a substitute for real per-pid authorization
+     * inside routeToolCall. If either of those mitigations is removed
+     * (auth-ajax-actions added, or SecureChatAI's hook registry edited),
+     * any authenticated caller can read/write any project's data.
+     * Fix tracked in CLAUDE.md "Security — known issues" section.
      */
     public function redcap_module_api($action = null, $payload = [])
     {
+        // PHI-safe: log action name and payload shape only — never the payload
+        // contents (which can contain record data, filters with patient info).
         $this->emDebug("Agent tool call", [
             'action' => $action,
-            'payload' => $payload
+            'payload_keys' => is_array($payload) ? array_keys($payload) : [],
+            'has_filter' => !empty($payload['filter']),
         ]);
 
         $response = $this->routeToolCall($action, $payload);
 
-        // Log the response (truncated) so we can verify what the LLM actually
-        // received — e.g. that preview_markdown survived serialization.
+        // PHI-safe: log response shape only. Full responses (which can contain
+        // preview_markdown with record IDs, or raw records when include_records)
+        // are never written to the log.
         $this->emDebug("Agent tool response", [
             'action' => $action,
-            'response_json' => substr((string)json_encode($response, JSON_UNESCAPED_UNICODE), 0, 8000),
+            'response_keys' => is_array($response) ? array_keys($response) : [],
+            'has_error' => !empty($response['error']),
+            'total_record_count' => $response['total_record_count'] ?? null,
+            'value_count' => $response['value_count'] ?? null,
         ]);
 
         return $response;
@@ -813,8 +835,10 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 }
             }
 
+            // PHI-safe: log query length only — never the query itself (may
+            // contain project names or patient identifiers from user input).
             $this->emDebug("projects.search debug", [
-                'query' => $query,
+                'query_length' => strlen($query),
                 'userid' => $userid,
                 'has_session' => isset($_SESSION['username'])
             ]);

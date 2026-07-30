@@ -1,21 +1,6 @@
 {
 	"tools": [
 		{
-			"name": "projects.search",
-			"description": "Search for REDCap projects by name, description, or project ID using fuzzy matching. Returns matching project IDs and titles.",
-			"action": "projects_search",
-			"parameters": {
-				"type": "object",
-				"properties": {
-					"query": {"type": "string", "description": "Search term — project name, description text, or numeric project ID"},
-					"limit": {"type": "integer", "description": "Maximum number of results to return", "default": 10}
-				},
-				"required": ["query"]
-			},
-			"readOnly": true,
-			"destructive": false
-		},
-		{
 			"name": "projects.getMetadata",
 			"description": "Get the data dictionary (field definitions) for a REDCap project. Returns field names, types, labels, validation, choices, and branching logic. Use this to understand a project's structure before reading or writing records. PROACTIVE USE: when the user describes a concept in natural language ('severity', 'consented', 'enrolled', 'site'), call this tool FIRST and read each candidate's field_label to pick the right field yourself — do NOT ask the user to name the field for you. That is your job. Only ask the user to disambiguate when the top 2 labels are both plausible for their wording AND a wrong pick would be hard to recover from.",
 			"action": "projects_getMetadata",

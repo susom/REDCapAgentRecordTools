@@ -1187,7 +1187,21 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             $meta = []; // labels are best-effort; raw values on failure
         }
 
-        $esc = fn($v) => str_replace(["|", "\n", "\r"], ['\|', ' ', ' '], trim((string)$v));
+        // Per-cell length cap — keeps the markdown table from collapsing into a
+        // wall of text when a textarea field holds 1000+ chars. Capped AFTER
+        // label resolution so "Mild/Moderate/Severe" enum labels (which are
+        // short) never get truncated; raw long values get cut at $maxCellLen
+        // with a single-character ellipsis. Full value is still available
+        // via include_records=true for users who need it.
+        $maxCellLen = 120;
+        $truncate = function (string $s) use ($maxCellLen): string {
+            if (mb_strlen($s) <= $maxCellLen) return $s;
+            return mb_substr($s, 0, $maxCellLen - 1) . '…';
+        };
+        $esc = function ($v) use ($truncate) {
+            $escaped = str_replace(["|", "\n", "\r"], ['\|', ' ', ' '], trim((string)$v));
+            return $truncate($escaped);
+        };
         $label = function ($field, $val) use ($meta, $esc) {
             // Checkbox values arrive as arrays of code => '0'/'1' — render the checked labels
             if (is_array($val)) {

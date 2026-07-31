@@ -1111,6 +1111,11 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
      * Columns: record_id + fields referenced in the filter + the fields with
      * the most non-empty values in the sample (checkbox arrays and form
      * status fields excluded), capped at $maxCols. Rows capped at $maxRows.
+     *
+     * Checkbox fields: REDCap returns these as array values
+     * (`{code => '0'|'1', ...}` per option). The preview renders each row's
+     * checked options as a comma-joined list of labels — so users see e.g.
+     * "Blister, Bruised, Redness" instead of an opaque array.
      */
     private function cappyBuildPreview(int $pid, array $page, ?string $filter, int $maxRows = 20, int $maxCols = 8): string
     {
@@ -1120,22 +1125,39 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
         $rows = $this->cappyFlattenRows($page);
         if (empty($rows)) return '';
 
+        // Identify checkbox fields: scan rows for any field whose value is an
+        // array (the checkbox shape REDCap returns). Confirm each candidate
+        // against the data dictionary so we don't accidentally promote scalar
+        // fields that happen to be array-typed for some other reason.
+        $checkboxFields = $this->cappyDetectCheckboxFields($pid, $rows);
+
         // Column selection
         $cols = [$recordIdField];
         foreach ($this->cappyExtractFilterFields($filter ?? '') as $f) {
             if ($f === $recordIdField || in_array($f, $cols)) continue;
             foreach ($rows as [, $fields]) {
-                if (array_key_exists($f, $fields) && !is_array($fields[$f])) { $cols[] = $f; break; }
+                if (!array_key_exists($f, $fields)) continue;
+                // Allow checkbox bases (array values) and scalar values alike.
+                if (isset($checkboxFields[$f])) { $cols[] = $f; break; }
+                if (!is_array($fields[$f])) { $cols[] = $f; break; }
             }
         }
-        // Rank remaining scalar fields by non-empty count across the sample
+        // Rank remaining fields by non-empty count across the sample.
+        // - Scalar fields: count rows where the value is non-empty.
+        // - Checkbox fields: count rows where any option is checked (truthy).
+        // Both kinds are sorted into one ranking so the most informative columns
+        // win the remaining slots regardless of type.
         $scores = [];
         foreach (array_slice($rows, 0, 50) as [, $fields]) {
             foreach ($fields as $field => $val) {
-                if (is_array($val) || in_array($field, $cols)) continue;
+                if (in_array($field, $cols)) continue;
                 if (strpos($field, '___') !== false || substr($field, -9) === '_complete') continue;
                 if (!isset($scores[$field])) $scores[$field] = 0;
-                if ($val !== '' && $val !== null) $scores[$field]++;
+                if (isset($checkboxFields[$field])) {
+                    if (is_array($val) && $this->cappyRowHasCheckedCheckbox($val)) $scores[$field]++;
+                } else {
+                    if (!is_array($val) && $val !== '' && $val !== null) $scores[$field]++;
+                }
             }
         }
         arsort($scores);
@@ -1230,6 +1252,52 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             $out .= '| ' . implode(' | ', $cells) . " |\n";
         }
         return $out;
+    }
+
+    /**
+     * Scan a row batch for fields whose value is an array (the checkbox
+     * shape REDCap returns: `{code => '0'|'1', ...}` per option). Confirm
+     * each candidate against the data dictionary so we don't accidentally
+     * promote scalar fields that happen to be array-typed for some other
+     * reason. Returns base field name => true for fast lookup.
+     */
+    private function cappyDetectCheckboxFields(int $pid, array $rows): array
+    {
+        $candidates = [];
+        foreach ($rows as [, $fields]) {
+            foreach ($fields as $field => $val) {
+                if (!is_array($val)) continue;
+                if (strpos($field, '___') !== false) continue; // legacy column-form
+                $candidates[$field] = true;
+            }
+        }
+        if (empty($candidates)) return [];
+        try {
+            $dd = \REDCap::getDataDictionary($pid, 'array', false, array_keys($candidates));
+        } catch (\Exception $e) {
+            return [];
+        }
+        $bases = [];
+        foreach ($dd as $fname => $info) {
+            if (($info['field_type'] ?? '') === 'checkbox') {
+                $bases[$fname] = true;
+            }
+        }
+        return $bases;
+    }
+
+    /**
+     * True if a checkbox-shaped array value has any checked option.
+     * Accepts both numeric-keyed arrays (REDCap checkbox shape) and
+     * legacy `code => '0'|'1'` strings.
+     */
+    private function cappyRowHasCheckedCheckbox($val): bool
+    {
+        if (!is_array($val)) return false;
+        foreach ($val as $flag) {
+            if ((string)$flag !== '' && (string)$flag !== '0') return true;
+        }
+        return false;
     }
 
     /**

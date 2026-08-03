@@ -1975,12 +1975,19 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
     }
 
     // -----------------------------------------------------------------
-    // Session cache for large tool results. The LLM gets a short reference
-    // id; the full data lives in $_SESSION for the lifetime of the session
-    // (default 10 min, configurable below). Survives iframe reloads, full
-    // page reloads, and any same-session navigation — the whole point of
-    // building this client-of-server instead of the earlier sessionStorage
-    // plan.
+    // File-backed cache for large tool results. The LLM gets a short reference
+    // id; the full data lives in a per-session cache FILE for the lifetime of
+    // the session (default 30 min, configurable below). Survives iframe
+    // reloads, full page reloads, and any same-session navigation.
+    //
+    // Why a file and not $_SESSION: the chatbot agent loop can run for tens of
+    // seconds (multiple LLM round-trips + tool calls). PHP holds an EXCLUSIVE
+    // lock on the session file for the whole request, so keeping the cache in
+    // $_SESSION forced every concurrent tab (they share one session cookie) to
+    // serialize behind that loop — surfacing to users as "timeout" toasts.
+    // Keeping the cache OUT of $_SESSION lets the chatbot release the session
+    // write-lock (session_write_close) for the duration of the loop. Same
+    // single-host locality assumption as the previous $_SESSION-file approach.
     // -----------------------------------------------------------------
 
     /** TTL for cached tool results, in seconds. 30 min — long enough for a
@@ -1991,31 +1998,116 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
      *  this, the per-call Project construction outweighs one scoped query. */
     const CAPPY_FILTER_INLINE_MAX = 200;
 
+    /** Directory holding the file-backed tool-result caches. Created 0700 on
+     *  first use. Lives under the system temp dir — same PHI posture as PHP's
+     *  own session files, which already serialize this exact recordset data. */
+    private function cappyCacheDir(): string
+    {
+        $dir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'cappy_data_cache';
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0700, true);
+        }
+        return $dir;
+    }
+
+    /** Current PHP session id, or '' when there is no session (e.g. a pure
+     *  token-API request). session_id() stays readable after
+     *  session_write_close(), so the normal Cappy browser flow always has one. */
+    private function cappyCurrentSid(): string
+    {
+        return session_id() ?: '';
+    }
+
+    /** Absolute path for a (session, ref) pair. Session-scoped via the PHP
+     *  session id so one user can never read another's cached recordset even
+     *  if a ref id leaks. */
+    private function cappyCachePath(string $ref, string $sid): string
+    {
+        return $this->cappyCacheDir() . DIRECTORY_SEPARATOR
+            . hash('sha256', $sid . '|' . $ref) . '.cache';
+    }
+
     /**
-     * Stash $payload in the PHP session under a short random reference id
-     * and return that reference. Caller passes the reference back to retrieve
-     * the data (via cappyCacheFetch). Auto-prunes expired entries on every call.
+     * Stash $payload in a per-session cache file under a short random reference
+     * id and return that reference. Caller passes the reference back to
+     * retrieve the data (via cappyCacheFetch). Opportunistically prunes stale
+     * files.
+     *
+     * When there is no PHP session (a stateless token-API request), the data is
+     * NOT persisted: a session-less caller can't be isolated from other
+     * session-less callers (they'd share one namespace) and can't paginate
+     * across requests anyway. It still gets a ref back; a later fetch simply
+     * misses and the tool re-runs. This matches the pre-file ($_SESSION)
+     * behavior, where a session-less request had no persistent cache.
      */
     private function cappyCacheStore(string $key, $payload): string
     {
-        if (!isset($_SESSION['cappy_data_cache'])) {
-            $_SESSION['cappy_data_cache'] = [];
-        }
         $now = time();
-        // Prune expired entries (cheap; usually a few)
-        foreach ($_SESSION['cappy_data_cache'] as $k => $entry) {
-            if (($entry['expires_at'] ?? 0) < $now) {
-                unset($_SESSION['cappy_data_cache'][$k]);
+        $this->cappyCachePrune($now);
+
+        $ref = 'ref_' . bin2hex(random_bytes(4));
+        $sid = $this->cappyCurrentSid();
+        if ($sid === '') {
+            return $ref; // no session → don't persist (see docblock)
+        }
+
+        $entry = [
+            'tool'       => $key,
+            'sid'        => $sid,
+            'data'       => $payload,
+            'expires_at' => $now + self::CAPPY_CACHE_TTL,
+            'stored_at'  => $now,
+        ];
+
+        // serialize() (not json_encode) to round-trip PHP types faithfully and
+        // survive any non-UTF-8 bytes in record data. Atomic publish via
+        // temp-file + rename so a concurrent reader never sees a partial write.
+        $path = $this->cappyCachePath($ref, $sid);
+        $tmp  = $path . '.' . bin2hex(random_bytes(4)) . '.tmp';
+        if (@file_put_contents($tmp, serialize($entry), LOCK_EX) !== false) {
+            @chmod($tmp, 0600);
+            if (!@rename($tmp, $path)) {
+                @unlink($tmp); // don't leak the temp file if the publish failed
             }
         }
-        $ref = 'ref_' . bin2hex(random_bytes(4));
-        $_SESSION['cappy_data_cache'][$ref] = [
-            'tool' => $key,
-            'data' => $payload,
-            'expires_at' => $now + self::CAPPY_CACHE_TTL,
-            'stored_at' => $now,
-        ];
         return $ref;
+    }
+
+    /**
+     * Delete expired cache files and orphaned temp files. Opportunistic: to
+     * avoid globbing the shared cache dir on every single tool call under
+     * concurrent multi-user load, a full sweep runs only ~1-in-10 calls.
+     */
+    private function cappyCachePrune(int $now): void
+    {
+        if (random_int(1, 10) !== 1) {
+            return;
+        }
+        $dir = $this->cappyCacheDir();
+
+        // Expired published entries. mtime ≈ stored_at, so mtime older than the
+        // TTL ⟺ the entry has expired.
+        $files = @glob($dir . DIRECTORY_SEPARATOR . '*.cache');
+        if (is_array($files)) {
+            foreach ($files as $f) {
+                if (@filemtime($f) < $now - self::CAPPY_CACHE_TTL) {
+                    @unlink($f);
+                }
+            }
+        }
+
+        // Orphaned temp files from a crash or failed rename between write and
+        // publish. A live .tmp exists for microseconds, so anything older than a
+        // minute is dead. The *.cache sweep above never matches these, so
+        // without this they would accumulate forever.
+        $tmps = @glob($dir . DIRECTORY_SEPARATOR . '*.tmp');
+        if (is_array($tmps)) {
+            foreach ($tmps as $t) {
+                if (@filemtime($t) < $now - 60) {
+                    @unlink($t);
+                }
+            }
+        }
     }
 
     /**
@@ -2024,12 +2116,36 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
      */
     private function cappyCacheFetch(string $ref, ?string $expectedKey = null)
     {
-        if (!isset($_SESSION['cappy_data_cache'][$ref])) {
+        // Reject anything that isn't our own ref format before touching the FS.
+        if (!preg_match('/^ref_[0-9a-f]{8}$/', $ref)) {
             return null;
         }
-        $entry = $_SESSION['cappy_data_cache'][$ref];
+        // No session → nothing was persisted for us to read (see cappyCacheStore).
+        $sid = $this->cappyCurrentSid();
+        if ($sid === '') {
+            return null;
+        }
+        $path = $this->cappyCachePath($ref, $sid);
+        if (!is_file($path)) {
+            return null;
+        }
+        $raw = @file_get_contents($path);
+        if ($raw === false) {
+            return null;
+        }
+        // allowed_classes=false: never instantiate objects from cache files.
+        $entry = @unserialize($raw, ['allowed_classes' => false]);
+        if (!is_array($entry)) {
+            @unlink($path);
+            return null;
+        }
         if (($entry['expires_at'] ?? 0) < time()) {
-            unset($_SESSION['cappy_data_cache'][$ref]);
+            @unlink($path);
+            return null;
+        }
+        // Defense-in-depth: the file name is already session-scoped, but verify
+        // the stored session id matches too.
+        if (($entry['sid'] ?? null) !== $sid) {
             return null;
         }
         if ($expectedKey !== null && ($entry['tool'] ?? null) !== $expectedKey) {

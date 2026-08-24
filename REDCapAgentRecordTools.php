@@ -59,13 +59,24 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
         // PHI-safe: log response shape only. Full responses (which can contain
         // preview_markdown with record IDs, or raw records when include_records)
         // are never written to the log.
-        $this->emDebug("Agent tool response", [
+        $isError = !empty($response['error']);
+        $logEntry = [
             'action' => $action,
             'response_keys' => is_array($response) ? array_keys($response) : [],
-            'has_error' => !empty($response['error']),
+            'has_error' => $isError,
             'total_record_count' => $response['total_record_count'] ?? null,
             'value_count' => $response['value_count'] ?? null,
-        ]);
+        ];
+        // On failure, log WHY. Every error string in this file is a fixed,
+        // developer-authored diagnostic ("Reference ref_x not found or expired",
+        // "Missing required parameter: pid") — no record data, so it's safe here and
+        // it's the difference between "a tool failed" and a usable answer. Without
+        // it, has_error=1 was all we had, and diagnosing a failed turn meant
+        // guessing which of a dozen error branches fired.
+        if ($isError && isset($response['message'])) {
+            $logEntry['error_message'] = (string)$response['message'];
+        }
+        $this->emDebug("Agent tool response", $logEntry);
 
         return $response;
     }

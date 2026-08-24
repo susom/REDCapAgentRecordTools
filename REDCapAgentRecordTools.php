@@ -337,6 +337,22 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             return $return_format === 'json' ? json_encode($page) : $page;
         };
 
+        // What we tell the model about raw rows MUST depend on whether it already
+        // asked for them. The old note said "rows are withheld, pass
+        // include_records=true" unconditionally — including to a caller that had
+        // just passed exactly that. Combined with SecureChatAI's result cap (which
+        // drops trailing keys, and `records` is the last key), the model got a
+        // response with `records` amputated plus an instruction to ask again. It
+        // obliged, repeatedly, until the loop detector killed the turn. Observed on
+        // PID 70: a 182,943-char result against an 8,000-char cap, five times.
+        $rawRowsHint = $includeRecords
+            ? "You requested raw rows, so they are in 'records' IF they fit. If 'records' "
+                . "is missing or the result reports itself truncated, the rows did NOT fit "
+                . "the token budget — do NOT request them again, it will truncate "
+                . "identically. Either narrow the filter, lower 'limit' until they fit, or "
+                . "answer from 'preview_markdown'."
+            : "Raw rows are withheld by default; pass include_records=true only if you need them for computation.";
+
         // Append path: run the new filter as a fresh query, then UNION the
         // results into the referenced cached recordset (the "accumulating
         // working set" — e.g. severity=3 set, then "also severity=4" merges
@@ -421,7 +437,8 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 "note" => ($filteredFromCache
                     ? "Filtered from the cached recordset in memory (no database re-query). Subset cached as $reference — pass it back with a new filter to narrow further, or with offset/limit to page. "
                     : "Served from session cache (reference $reference). ")
-                    . "IMPORTANT: render 'preview_markdown' to the user VERBATIM as a markdown table — do not ask which fields to show, do not summarize instead of showing. Raw rows are withheld by default; pass include_records=true only if you need them for computation."
+                    . "IMPORTANT: render 'preview_markdown' to the user VERBATIM as a markdown table — do not ask which fields to show, do not summarize instead of showing. "
+                    . $rawRowsHint
                     . $largeSetNote,
                 "records" => $formatRecords($page),
             ];
@@ -493,7 +510,9 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 "note" => ($mergedFrom
                     ? "APPENDED to the cached working set: {$mergedFrom['new_count']} records matched the new filter, {$mergedFrom['added_count']} were new — merged set is now $total_record_count records (was {$mergedFrom['base_count']}), cached as \"$ref\". The accumulated set is what the user now means by 'the records' — narrow it with reference + new filter, or append more with append_to + new filter. "
                     : "")
-                    . "IMPORTANT: render 'preview_markdown' to the user VERBATIM as a markdown table — do not ask which fields to show, do not summarize instead of showing. Raw rows are withheld by default; pass include_records=true only if you need them for computation. The full result set is cached as reference \"$ref\" — page with offset/limit (each page returns its own preview_markdown) or narrow with a new filter.",
+                    . "IMPORTANT: render 'preview_markdown' to the user VERBATIM as a markdown table — do not ask which fields to show, do not summarize instead of showing. "
+                    . $rawRowsHint
+                    . " The full result set is cached as reference \"$ref\" — page with offset/limit (each page returns its own preview_markdown) or narrow with a new filter.",
                  "records" => $formatRecords($page),
             ];
 

@@ -26,7 +26,9 @@
 		"records_get":            { "description": "Agent tool: get specific record data by record ID",    "access": ["auth"] },
 		"records_search":         { "description": "Agent tool: search records with optional logic filter","access": ["auth"] },
 		"records_evaluateLogic":  { "description": "Agent tool: evaluate REDCap logic for a record",      "access": ["auth"] },
-		"survey_getLink":         { "description": "Agent tool: generate survey link for a record",        "access": ["auth"] },
+		"survey_getLink":         { "description": "Agent tool: generate survey link for a record",        "access": ["auth"] }
+	},
+	"_disabled_api_actions_no_write_2026-08-24": {
 		"records_save":           { "description": "Agent tool: create or update record data",             "access": ["auth"] }
 	},
 

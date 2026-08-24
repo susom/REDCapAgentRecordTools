@@ -103,8 +103,11 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             case "projects_search":
                 return $this->toolSearchProjects($payload);
 
-            case "records_save":
-                return $this->toolSaveRecords($payload);
+            // WRITE DISABLED 2026-08-24: "records_save" intentionally has NO case here, so
+            // it falls through to default ("Unknown action"). Guarantees no record writes
+            // via Cappy pending real per-pid authorization (see redcap_module_api() docblock
+            // above). Also pulled from tools.json and config.json api-actions; toolSaveRecords()
+            // is a third, independent gate. Restore via git history, not by re-adding a case.
 
             default:
                 return [
@@ -908,76 +911,21 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
     }
 
     /**
-     * Tool 10: records.save
-     * Create or update record data
+     * Tool 10: records.save — WRITE DISABLED 2026-08-24
+     * Guarantees no record writes via Cappy pending real per-pid authorization
+     * (see the redcap_module_api() docblock above). Three independent gates:
+     * pulled from tools.json, no case in routeToolCall(), and this hard return.
+     * The method stays public so a direct cross-EM call lands here too.
+     * The original \REDCap::saveData() implementation was removed in this same
+     * commit — recover it from git history if this is ever re-enabled.
      */
     public function toolSaveRecords(array $payload)
     {
-        if (empty($payload['pid'])) {
-            return [
-                "error" => true,
-                "message" => "Missing required parameter: pid"
-            ];
-        }
-
-        if (empty($payload['data'])) {
-            return [
-                "error" => true,
-                "message" => "Missing required parameter: data"
-            ];
-        }
-
-        $pid = (int)$payload['pid'];
-        $data = $payload['data'];
-        $overwrite = $payload['overwrite'] ?? false; // Default: normal (not overwrite)
-
-        try {
-            $saveMode = $overwrite ? 'overwrite' : 'normal';
-
-            // Normalize data to flat format for saveData('json').
-            // The LLM may send either:
-            //   Flat:   {"cas_id": "123", "field": "value"}
-            //   Nested: {"123": {"cas_id": "123", "field": "value"}}
-            // Detect nested format (values are arrays, keys are non-numeric) and flatten.
-            $firstValue = reset($data);
-            if (is_array($firstValue) && !isset($data[0])) {
-                $data = array_values($data);
-            }
-
-            // Wrap single record in array
-            if (!isset($data[0])) {
-                $data = [$data];
-            }
-
-            $result = \REDCap::saveData($pid, 'json', json_encode($data), $saveMode);
-
-            // Check for errors
-            if (!empty($result['errors'])) {
-                return [
-                    "error" => true,
-                    "message" => "Failed to save data",
-                    "errors" => $result['errors'],
-                    "warnings" => $result['warnings'] ?? [],
-                    "data_submitted" => $data
-                ];
-            }
-
-            return [
-                "pid" => $pid,
-                "success" => true,
-                "records_saved" => $result['item_count'] ?? count($data),
-                "record_ids" => $result['ids'] ?? [],
-                "warnings" => $result['warnings'] ?? [],
-                "overwrite_mode" => $overwrite
-            ];
-        } catch (\Exception $e) {
-            $this->emError("saveRecords error for pid $pid: " . $e->getMessage());
-            return [
-                "error" => true,
-                 "message" => "Failed to save records: " . $e->getMessage()
-             ];
-         }
-     }
+        return [
+            "error" => true,
+            "message" => "records.save is disabled — Cappy agent mode cannot write record data."
+        ];
+    }
 
     /**
      * Validate that every [field] referenced in a REDCap logic filter exists

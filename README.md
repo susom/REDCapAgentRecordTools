@@ -17,7 +17,7 @@ The module provides **atomic, auditable operations** invoked by an LLM — it is
   - [records.get](#recordsget)
   - [records.search](#recordssearch)
   - [records.evaluateLogic](#recordsevaluatelogic)
-  - [records.save](#recordssave)
+  - [records.save](#recordssave) — ⛔ **DISABLED 2026-08-24**
   - [survey.getLink](#surveygetlink)
 - [Example Agent Workflows](#example-agent-workflows)
 - [How to Build Your Own Tool EM](#how-to-build-your-own-tool-em)
@@ -280,9 +280,20 @@ Evaluate a REDCap logic expression against a specific record. Returns `true`/`fa
 
 ### records.save
 
+> ## ⛔ DISABLED 2026-08-24 — THIS TOOL IS NOT AVAILABLE
+>
+> This EM is **read-only**. `records.save` was removed from `tools.json`, from the
+> `routeToolCall()` router, and from `config.json` `api-actions`; `toolSaveRecords()`
+> now returns an error unconditionally. Cappy **cannot write REDCap data**.
+>
+> The reference below is retained for restore purposes only. Do not present this
+> tool as available, and do not write code or prompts that call it. Re-enabling it
+> requires per-pid authorization inside `routeToolCall()` first — see the security
+> docblock on `redcap_module_api()`.
+
 **Action:** `records_save`
 
-Create or update record data.
+Create or update record data. **(Disabled — see banner above.)**
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -383,15 +394,18 @@ Generate a survey URL. The instrument must be survey-enabled in the project.
 >
 > **Agent:** "23 participants have completed baseline but not 6-month followup."
 
-### Data Update
+### Data Update — ⛔ not supported (read-only EM)
 
 > **User:** "Mark my consent form as complete"
 >
-> 1. `projects.search(query="intake")` → Find project
-> 2. `projects.getMetadata(pid=30)` → Learn field names
-> 3. `records.save(pid=30, data={record_id:"irvins", consent_complete:"2"}, overwrite=true)` → Update
+> 1. `projects.getMetadata(pid=30)` → Locate the `consent_complete` field
 >
-> **Agent:** "Done! Your consent form is marked complete."
+> **Agent:** "I can't make data changes — this assistant is read-only. You'll need
+> to set *Consent Complete* yourself on the Consent form for record `irvins`. Want
+> me to highlight that field on the page?"
+
+There is no write workflow. `records.save` is disabled; see the banner in its
+section above.
 
 ---
 

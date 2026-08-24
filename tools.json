@@ -135,7 +135,9 @@
 			},
 			"readOnly": true,
 			"destructive": false
-		},
+		}
+	],
+	"_disabled_tools_no_write_2026-08-24": [
 		{
 			"name": "records.save",
 			"description": "Create a new record or update an existing record in a REDCap project. The data object must include the record ID field. Use projects.getMetadata first to learn the field names and types before saving.",

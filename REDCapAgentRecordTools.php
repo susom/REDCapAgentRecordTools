@@ -522,10 +522,12 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
         // agent can write [d_legal_sex] = "Female" and still match the 2-codes.
         // Nerds who already use the code get a no-op expansion.
         $filterExpansions = [];
+        $filterHints = [];
         if (!empty($filter)) {
             $expanded = $this->cappyExpandFilterLabels($pid, $filter);
             $filter = $expanded['filter'];
             $filterExpansions = $expanded['translations'];
+            $filterHints = $expanded['hints'] ?? [];
         }
         $fields = $payload['fields'] ?? null; // Optional
         $return_format = $payload['return_format'] ?? 'array'; // 'array' or 'json'
@@ -559,9 +561,11 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
         $rawRowsHint = $includeRecords
             ? "You requested raw rows, so they are in 'records' IF they fit. If 'records' "
                 . "is missing or the result reports itself truncated, the rows did NOT fit "
-                . "the token budget — do NOT request them again, it will truncate "
-                . "identically. Either narrow the filter, lower 'limit' until they fit, or "
-                . "answer from 'preview_markdown'."
+                . "the token budget — do NOT request them again, and do NOT retry with a "
+                . "smaller 'limit': what usually overflows is the WIDTH of each record (a "
+                . "checkbox field with many options costs over a kilobyte per record), so "
+                . "fewer records truncates the same way. Instead pass 'fields' to ask for "
+                . "only the columns you actually need, or answer from 'preview_markdown'."
             : "Raw rows are withheld by default; pass include_records=true only if you need them for computation.";
 
         // Append path: run the new filter as a fresh query, then UNION the
@@ -711,6 +715,10 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 "pid" => $pid,
                 "filter" => $filter,
                 "filter_translations" => $filterExpansions,
+                // Present only when a filter literal is not a choice of the
+                // field it was compared against but IS a choice elsewhere —
+                // turns a true-but-useless 0 into a legible wrong-field hint.
+                "value_not_on_this_field" => $filterHints,
                 "reference" => $ref,
                 "total_record_count" => $total_record_count,
                 "returned_count" => $returned_count,
@@ -723,7 +731,12 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                     : "")
                     . "IMPORTANT: render 'preview_markdown' to the user VERBATIM as a markdown table — do not ask which fields to show, do not summarize instead of showing. "
                     . $rawRowsHint
-                    . " The full result set is cached as reference \"$ref\" — page with offset/limit (each page returns its own preview_markdown) or narrow with a new filter.",
+                    // Be explicit that paging yields the next PREVIEW page, not
+                    // raw rows. Sitting next to the "don't retry with a smaller
+                    // limit" warning above, an unqualified "page with
+                    // offset/limit" reads as permission to keep re-requesting
+                    // rows — which is the loop this note exists to prevent.
+                    . " The full result set is cached as reference \"$ref\" — pass it with offset/limit to get the NEXT PAGE OF preview_markdown (paging does not make withheld raw rows fit), or with a new filter to narrow.",
                  "records" => $formatRecords($page),
             ];
 
@@ -779,10 +792,12 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
         // Expand any label literals in the filter to (code OR label) — same as
         // toolSearchRecords so [d_legal_sex] = "Female" still matches code 2.
         $filterExpansions = [];
+        $filterHints = [];
         if (!empty($filter)) {
             $expanded = $this->cappyExpandFilterLabels($pid, $filter);
             $filter = $expanded['filter'];
             $filterExpansions = $expanded['translations'];
+            $filterHints = $expanded['hints'] ?? [];
         }
 
         try {
@@ -806,6 +821,10 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 "pid"      => $pid,
                 "filter"   => $filter,
                 "filter_translations" => $filterExpansions,
+                // Present only when a filter literal is not a choice of the
+                // field it was compared against but IS a choice elsewhere —
+                // turns a true-but-useless 0 into a legible wrong-field hint.
+                "value_not_on_this_field" => $filterHints,
                 "count"    => $count,
                 "record_id_field" => $recordIdField,
                 "note"     => "This is the count of records matching the filter (or all records if no filter). No record data was returned."
@@ -1635,7 +1654,7 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             return ["error" => true, "message" => "Missing required parameter: field"];
         }
         $function = strtolower($payload['function'] ?? '');
-        $validFns = ['count', 'sum', 'mean', 'median', 'mode', 'min', 'max', 'stddev'];
+        $validFns = ['count', 'distinct_count', 'sum', 'mean', 'median', 'mode', 'min', 'max', 'stddev'];
         if (!in_array($function, $validFns, true)) {
             return ["error" => true, "message" => "Invalid function '$function'. Must be one of: " . implode(', ', $validFns)];
         }
@@ -1647,10 +1666,12 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             if ($fieldError !== null) return $fieldError;
         }
         $filterExpansions = [];
+        $filterHints = [];
         if (!empty($filter)) {
             $expanded = $this->cappyExpandFilterLabels($pid, $filter);
             $filter = $expanded['filter'];
             $filterExpansions = $expanded['translations'];
+            $filterHints = $expanded['hints'] ?? [];
         }
 
         try {
@@ -1671,29 +1692,73 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             // a sensible question. Agent can also force numeric with
             // treat_as_numeric=true.
             $treatAsNumeric = !empty($payload['treat_as_numeric']);
-            $categoricalFns = ['count', 'mode', 'median', 'min', 'max'];
-            $numericFns     = ['count', 'mode', 'median', 'min', 'max', 'sum', 'mean', 'stddev'];
+            // distinct_count is meaningful for EVERY field type — it counts
+            // distinct stored values and never coerces anything to a number.
+            $categoricalFns = ['count', 'distinct_count', 'mode', 'median', 'min', 'max'];
+            $numericFns     = ['count', 'distinct_count', 'mode', 'median', 'min', 'max', 'sum', 'mean', 'stddev'];
+            // Dates are stored Y-M-D by REDCap regardless of the field's DISPLAY
+            // validation (date_mdy on this instance stores '2023-01-01'), so
+            // lexical ordering is chronological and min/max are safe as STRINGS.
+            // They are NOT safe as numbers: CAST('2023-01-01' AS DECIMAL) is 2023.
+            $dateFns        = ['count', 'distinct_count', 'mode', 'min', 'max'];
+            $textFreeFns    = ['count', 'distinct_count', 'mode'];
+
+            // A 'text' field can hold a number, a date, or prose. Only the
+            // validation type distinguishes them, and getting this wrong is not
+            // a degraded answer but a fabricated one: before this check,
+            // mean(pt_name) returned 0.0 over 1005 patient names, and
+            // min(p2_admission_date) returned 2023 for '2023-01-01'.
+            $validation = strtolower($this->cappyFieldValidation($dd[$field] ?? []));
+            $isDateField = $validation !== '' && preg_match('/^date|^datetime/', $validation);
+            if ($isDateField) {
+                $textFns = $dateFns;
+            } elseif ($validation !== '' && preg_match('/^(number|integer)/', $validation)) {
+                $textFns = $numericFns;
+            } else {
+                // Unvalidated text is prose until proven otherwise.
+                $textFns = $treatAsNumeric ? $numericFns : $textFreeFns;
+            }
+
+            // Evaluated once: the map below is built eagerly, so calling this
+            // inline in both the radio and dropdown rows ran it twice on every
+            // aggregate — including for fields that are neither.
+            $codedAsNumeric = $treatAsNumeric || $this->cappyFieldHasNumericLabels($pid, $field);
+
             $allowed = [
-                'radio'      => $treatAsNumeric || $this->cappyFieldHasNumericLabels($pid, $field)
-                                 ? $numericFns : $categoricalFns,
-                'dropdown'   => $treatAsNumeric || $this->cappyFieldHasNumericLabels($pid, $field)
-                                 ? $numericFns : $categoricalFns,
+                'radio'      => $codedAsNumeric ? $numericFns : $categoricalFns,
+                'dropdown'   => $codedAsNumeric ? $numericFns : $categoricalFns,
                 'yesno'      => $categoricalFns, // 0/1 with "Yes/No" labels — don't treat as continuous
-                'checkbox'   => ['count', 'mode'],
-                'text'       => $numericFns,
-                'textarea'   => ['count', 'mode'],
+                'checkbox'   => ['count', 'distinct_count', 'mode'],
+                'text'       => $textFns,
+                // REDCap's data dictionary calls a textarea 'notes'. The old
+                // 'textarea' key never matched, so all 28 notes fields on a
+                // typical project fell through to the default instead.
+                'notes'      => $textFreeFns,
                 'calc'       => $numericFns,
                 'descriptive'=> ['count'],
                 'file'       => ['count'],
                 'sql'        => $numericFns,
                 'slider'     => $numericFns,
             ];
-            // Default — unknown / missing type — allow count and mode only (safe).
-            $effectiveAllowed = $allowed[$fieldType] ?? ['count', 'mode'];
+            // Default — unknown / missing type — allow the type-agnostic set.
+            $effectiveAllowed = $allowed[$fieldType] ?? $textFreeFns;
             if (!in_array($function, $effectiveAllowed, true)) {
-                $reason = $fieldType
-                    ? "Function '$function' is not meaningful for $fieldType fields (stored codes are categorical, not continuous). Allowed functions: " . implode(', ', $effectiveAllowed)
-                    : "Function '$function' cannot be applied to this field (unknown type). Allowed functions: " . implode(', ', $effectiveAllowed);
+                // Say WHY per actual field shape. The old text claimed "stored
+                // codes are categorical" for every type, which is nonsense for a
+                // free-text or date field and teaches the model the wrong lesson
+                // about what it just did.
+                if ($fieldType === '') {
+                    $why = "this field's type could not be determined";
+                } elseif ($isDateField) {
+                    $why = "'$field' holds dates ($validation); use min/max for earliest/latest, not arithmetic";
+                } elseif (in_array($fieldType, ['text', 'notes'], true)) {
+                    $why = "'$field' holds free text with no numeric validation, so arithmetic on it would be meaningless"
+                         . " (pass treat_as_numeric=true only if you know the values really are numbers)";
+                } else {
+                    $why = "$fieldType values are categorical codes, not continuous numbers";
+                }
+                $reason = "Function '$function' cannot be applied here: $why."
+                    . " Allowed functions for this field: " . implode(', ', $effectiveAllowed) . ".";
                 return [
                     "error" => true,
                     "message" => $reason,
@@ -1719,7 +1784,7 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             $values = null; // only used by slow path
             $sqlResult = null;
             if ($useFastPath) {
-                $sqlResult = $this->cappySqlAggregate($pid, $field, $function);
+                $sqlResult = $this->cappySqlAggregate($pid, $field, $function, $isDateField);
             }
 
             if ($sqlResult !== null) {
@@ -1767,6 +1832,10 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 "record_count" => $recordCount,
                 "filter" => $filter,
                 "filter_translations" => $filterExpansions,
+                // Present only when a filter literal is not a choice of the
+                // field it was compared against but IS a choice elsewhere —
+                // turns a true-but-useless 0 into a legible wrong-field hint.
+                "value_not_on_this_field" => $filterHints,
                 "source" => $sqlResult !== null ? "sql" : "getdata",
             ];
 
@@ -1780,11 +1849,36 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 case 'count':
                     $result["value"] = $n;
                     break;
+                case 'distinct_count':
+                    $result["value"] = $sqlResult !== null
+                        ? $sqlResult['distinct_count']
+                        : count(array_unique($values));
+                    // Say WHAT was counted. On a checkbox this is the number of
+                    // distinct options ever ticked across the cohort — which can
+                    // equal the whole option list and is not "options per
+                    // record". Naming it stops that being read as a per-person
+                    // figure.
+                    $result["note"] = $fieldType === 'checkbox'
+                        ? "Number of distinct options checked by at least one record (not options per record)."
+                        : "Number of distinct stored values across the matching records.";
+                    break;
+                case 'min':
+                case 'max':
+                    if ($isDateField) {
+                        // String comparison — see the allow-list note above.
+                        if ($sqlResult !== null && isset($sqlResult[$function])) {
+                            $v = $sqlResult[$function];
+                        } else {
+                            $strs = array_map('strval', $values);
+                            $v = $function === 'min' ? min($strs) : max($strs);
+                        }
+                        $result["value"] = $v;
+                        break;
+                    }
+                    // fall through to the numeric handling below
                 case 'sum':
                 case 'mean':
                 case 'median':
-                case 'min':
-                case 'max':
                 case 'stddev':
                     if ($sqlResult !== null && isset($sqlResult[$function])) {
                         $v = $sqlResult[$function];
@@ -1836,6 +1930,25 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             $this->emError("aggregateRecords error for pid $pid: " . $e->getMessage());
             return ["error" => true, "message" => "Failed to aggregate: " . $e->getMessage()];
         }
+    }
+
+    /**
+     * Pull a field's validation type ('date_mdy', 'number', 'time', …) out of an
+     * already-loaded data-dictionary row. '' when it has none.
+     *
+     * This is the ONLY thing distinguishing a text field holding a number from
+     * one holding a date from one holding prose, and aggregate's correctness
+     * depends on it: treating prose as numeric produced mean(pt_name) = 0.0
+     * over 1005 patient names.
+     *
+     * Takes the row rather than (pid, field) deliberately — every caller already
+     * has the dictionary in hand, and looking it up again here cost a second
+     * getDataDictionary() call per aggregate.
+     */
+    private function cappyFieldValidation(array $fieldInfo): string
+    {
+        return (string)($fieldInfo['text_validation_type_or_show_slider_number']
+            ?? ($fieldInfo['element_validation_type'] ?? ''));
     }
 
     /**
@@ -1935,7 +2048,7 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
      *   ]
      * Returns null on any SQL failure (caller should fall back to getData).
      */
-    private function cappySqlAggregate(int $pid, string $field, string $function): ?array
+    private function cappySqlAggregate(int $pid, string $field, string $function, bool $asString = false): ?array
     {
         try {
             // REDCap moves large projects to per-project tables (redcap_dataN).
@@ -1951,10 +2064,13 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             $aggSql = "SELECT
                         COUNT(*)                                  AS n,
                         COUNT(DISTINCT record)                    AS record_count,
+                        COUNT(DISTINCT value)                     AS dc,
                         SUM(CAST(value AS DECIMAL(20,6)))         AS s,
                         AVG(CAST(value AS DECIMAL(20,6)))         AS m,
                         MIN(CAST(value AS DECIMAL(20,6)))         AS mn,
                         MAX(CAST(value AS DECIMAL(20,6)))         AS mx,
+                        MIN(value)                                AS mn_s,
+                        MAX(value)                                AS mx_s,
                         STDDEV_SAMP(CAST(value AS DECIMAL(20,6))) AS sd
                     FROM {$table}
                     WHERE project_id = ?
@@ -1970,12 +2086,21 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 return ['n' => 0, 'record_count' => 0];
             }
             $out = [
-                'n'            => $n,
-                'record_count' => (int)$row['record_count'],
+                'n'              => $n,
+                'record_count'   => (int)$row['record_count'],
+                'distinct_count' => (int)$row['dc'],
             ];
 
-            if ($function === 'count') {
-                // already in $out['n']; caller uses that.
+            if ($function === 'count' || $function === 'distinct_count') {
+                // already in $out; caller uses those.
+            } elseif ($asString && ($function === 'min' || $function === 'max')) {
+                // Date/datetime fields: compare as strings. REDCap stores them
+                // Y-M-D so lexical order is chronological, whereas the numeric
+                // cast would turn '2023-01-01' into 2023.
+                $key = $function === 'min' ? 'mn_s' : 'mx_s';
+                if ($row[$key] !== null) {
+                    $out[$function] = (string)$row[$key];
+                }
             } elseif (in_array($function, ['sum', 'mean', 'min', 'max', 'stddev'], true)) {
                 $map = ['sum' => 's', 'mean' => 'm', 'min' => 'mn', 'max' => 'mx', 'stddev' => 'sd'];
                 if ($row[$map[$function]] !== null) {
@@ -2162,19 +2287,20 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
     private function cappyExpandFilterLabels(int $pid, string $filter): array
     {
         $translations = [];
+        $hints = [];
         if (trim($filter) === '') {
-            return ['filter' => $filter, 'translations' => $translations];
+            return ['filter' => $filter, 'translations' => $translations, 'hints' => $hints];
         }
 
         $map = $this->cappyBuildLabelMap($pid);
         if (empty($map['fields'])) {
-            return ['filter' => $filter, 'translations' => $translations];
+            return ['filter' => $filter, 'translations' => $translations, 'hints' => $hints];
         }
 
         // Match [field] op "value"  — op is one of = != <> >= <= > <
         $pattern = '/\[([a-zA-Z][a-zA-Z0-9_]*)\]\s*(<>|!=|>=|<=|=|>|<)\s*("[^"]*"|\'[^\']*\')/';
         if (!preg_match_all($pattern, $filter, $matches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE)) {
-            return ['filter' => $filter, 'translations' => $translations];
+            return ['filter' => $filter, 'translations' => $translations, 'hints' => $hints];
         }
 
         // Walk right-to-left so byte offsets remain valid as we splice in parens.
@@ -2208,8 +2334,23 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 // rather than guess which one the agent meant.
                 if (count(array_keys($fieldMap, $code, true)) > 1) continue;
             } else {
-                // Not a label or code for this field — leave alone (typo, free
-                // text, or a value the field genuinely doesn't have).
+                // Not a label or code for this field. Before giving up, check
+                // whether it IS a choice on some OTHER field — that is the
+                // difference between "0 records have this" and "you asked the
+                // wrong field". Observed: [roles] = "Unit Secretary" returned a
+                // true-but-useless 0 because the value lives elsewhere.
+                // (This is what the by_label index was built for; it had never
+                // been read by anything.)
+                $elsewhere = $map['by_label'][$literalLower] ?? [];
+                $elsewhere = array_values(array_diff($elsewhere, [$field]));
+                if (!empty($elsewhere)) {
+                    $hints[] = [
+                        'field'            => $field,
+                        'literal'          => $literal,
+                        'not_a_choice_for' => $field,
+                        'is_a_choice_for'  => array_slice($elsewhere, 0, 3),
+                    ];
+                }
                 continue;
             }
 
@@ -2252,7 +2393,7 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             ];
         }
 
-        return ['filter' => $filter, 'translations' => $translations];
+        return ['filter' => $filter, 'translations' => $translations, 'hints' => $hints];
     }
 
     /**

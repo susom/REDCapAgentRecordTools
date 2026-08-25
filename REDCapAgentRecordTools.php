@@ -2052,61 +2052,90 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
      *   [
      *     'fields' => [ field_name => [ label_lower => code, ... ], ... ],
      *     'by_label' => [ label_lower => [ fields_with_that_label, ... ] ],
+     *     'checkbox' => [ field_name => true, ... ],
      *   ]
      *
      * Only includes fields with parseable choices (radio/dropdown/yesno/checkbox).
      * Fields with no `element_enum` are skipped — free text can't be translated.
+     *
+     * 'checkbox' matters because checkbox fields need a DIFFERENT logic syntax
+     * from every other choice field — see cappyExpandFilterLabels().
      */
     private function cappyBuildLabelMap(int $pid): array
     {
         try {
             $dd = \REDCap::getDataDictionary($pid, 'array');
         } catch (\Exception $e) {
-            return ['fields' => [], 'by_label' => []];
+            return ['fields' => [], 'by_label' => [], 'checkbox' => []];
         }
-        if (empty($dd)) return ['fields' => [], 'by_label' => []];
+        if (empty($dd)) return ['fields' => [], 'by_label' => [], 'checkbox' => []];
 
         // Signature includes the relevant parts of the dictionary so any edit
-        // that could change a label/code pair forces a fresh parse.
+        // that could change a label/code pair forces a fresh parse. field_type
+        // is in here too: flipping a field radio->checkbox changes the logic
+        // syntax we must emit without necessarily changing its choices.
         $sigInput = '';
         foreach ($dd as $name => $info) {
-            $sigInput .= $name . "\t" . ($info['select_choices_or_calculations'] ?? '') . "\n";
+            $sigInput .= $name . "\t" . ($info['field_type'] ?? '')
+                . "\t" . ($info['select_choices_or_calculations'] ?? '') . "\n";
         }
         $signature = substr(md5($sigInput), 0, 12);
-        $cacheFile = sys_get_temp_dir() . "/redcap_label_map_{$pid}_{$signature}.json";
+        // BUMP THIS VERSION whenever the payload shape or the parsing rules
+        // change. The signature only covers dictionary CONTENT, so an older
+        // cache file for an unchanged dictionary would still look valid and
+        // silently serve a map built by the previous rules.
+        //   v2: added the 'checkbox' key
+        //   v3: yesno/truefalse fields gained implicit label pairs
+        $cacheFile = sys_get_temp_dir() . "/redcap_label_map_v3_{$pid}_{$signature}.json";
         $cacheTtl  = 3600;
         if (file_exists($cacheFile) && (time() - filemtime($cacheFile) < $cacheTtl)) {
             $cached = @json_decode(@file_get_contents($cacheFile), true);
-            if (is_array($cached) && isset($cached['fields'])) return $cached;
+            if (is_array($cached) && isset($cached['fields'], $cached['checkbox'])) return $cached;
         }
 
         $fields = [];
         $byLabel = [];
+        $checkbox = [];
         foreach ($dd as $name => $info) {
+            $type = $info['field_type'] ?? '';
             $enum = (string)($info['select_choices_or_calculations'] ?? '');
-            if ($enum === '') continue;
-            // REDCap stores element_enum with literal "\n" between options
-            // (and historically "|" in some installs). Split on either, then
-            // collapse any actual whitespace so labels normalize cleanly.
-            $opts = preg_split('/\\\\n|\|/', $enum);
-            $pairs = [];
-            foreach ($opts as $opt) {
-                $opt = trim(preg_replace('/\s+/', ' ', $opt));
-                if ($opt === '' || strpos($opt, ',') === false) continue;
-                [$code, $label] = explode(',', $opt, 2);
-                $code  = trim($code);
-                $label = trim($label);
-                if ($code === '' || $label === '') continue;
-                $pairs[strtolower($label)] = $code;
+            // yesno/truefalse are coded fields that carry NO element_enum, so
+            // the $enum === '' skip below used to drop them entirely — and
+            // "Yes" is about the most natural literal a caller can write.
+            // [workflow_challenges] = "Yes" silently matched 0 records when the
+            // true answer was 499. Their labels are implicit in the type.
+            if ($type === 'yesno') {
+                $pairs = ['yes' => '1', 'no' => '0'];
+            } elseif ($type === 'truefalse') {
+                $pairs = ['true' => '1', 'false' => '0'];
+            } elseif ($enum === '') {
+                continue;
+            } else {
+                // REDCap stores element_enum with literal "\n" between options
+                // (and historically "|" in some installs). Split on either, then
+                // collapse any actual whitespace so labels normalize cleanly.
+                $pairs = [];
+                foreach (preg_split('/\\\\n|\|/', $enum) as $opt) {
+                    $opt = trim(preg_replace('/\s+/', ' ', $opt));
+                    if ($opt === '' || strpos($opt, ',') === false) continue;
+                    [$code, $label] = explode(',', $opt, 2);
+                    $code  = trim($code);
+                    $label = trim($label);
+                    if ($code === '' || $label === '') continue;
+                    $pairs[strtolower($label)] = $code;
+                }
             }
             if (empty($pairs)) continue;
             $fields[$name] = $pairs;
+            if ($type === 'checkbox') {
+                $checkbox[$name] = true;
+            }
             foreach (array_keys($pairs) as $labelLower) {
                 $byLabel[$labelLower][] = $name;
             }
         }
 
-        $out = ['fields' => $fields, 'by_label' => $byLabel];
+        $out = ['fields' => $fields, 'by_label' => $byLabel, 'checkbox' => $checkbox];
         @file_put_contents($cacheFile, json_encode($out));
         return $out;
     }
@@ -2165,26 +2194,61 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             // Only act if this field has a parseable label map.
             if (!isset($map['fields'][$field])) continue;
             $fieldMap = $map['fields'][$field];
+            $isCheckbox = !empty($map['checkbox'][$field]);
 
-            // Already a code? Dedupe — no expansion needed.
-            if (in_array($literal, $fieldMap, true)) continue;
-            // Not a label for this field? Leave alone (could be a typo, free text, etc).
-            if (!isset($fieldMap[$literalLower])) continue;
-            // Duplicate (label → code) within this field? If two different
-            // labels collapse to the same code (rare in REDCap data), skip
-            // rather than guess which one the agent meant.
-            $code = $fieldMap[$literalLower];
-            if (count(array_keys($fieldMap, $code, true)) > 1) continue;
+            // Resolve the literal to a code. It's either already a code, or a
+            // label we can look up.
+            $literalIsCode = in_array($literal, $fieldMap, true);
+            if ($literalIsCode) {
+                $code = $literal;
+            } elseif (isset($fieldMap[$literalLower])) {
+                $code = $fieldMap[$literalLower];
+                // Duplicate (label → code) within this field? If two different
+                // labels collapse to the same code (rare in REDCap data), skip
+                // rather than guess which one the agent meant.
+                if (count(array_keys($fieldMap, $code, true)) > 1) continue;
+            } else {
+                // Not a label or code for this field — leave alone (typo, free
+                // text, or a value the field genuinely doesn't have).
+                continue;
+            }
 
-            $code = $fieldMap[$literalLower];
-            $expanded = "([{$field}] {$op} \"{$code}\" or [{$field}] {$op} {$raw})";
+            if ($isCheckbox) {
+                // CHECKBOX FIELDS USE A DIFFERENT LOGIC SYNTAX. REDCap stores
+                // each option as its own column, so membership is expressed as
+                //   [field(code)] = "1"
+                // An equality test against the BASE field name — which is what
+                // the else-branch below produces, and what this function used to
+                // emit for every field type — matches NOTHING. Silently. That
+                // turned "how many females speak Spanish?" into a confident
+                // "0" when the real answer was 86: the filter was accepted, a
+                // filter_translations entry claimed success, and zero records
+                // came back. A wrong answer that looks like a right one.
+                if ($op === '=') {
+                    $checked = '1';
+                } elseif ($op === '!=' || $op === '<>') {
+                    $checked = '0'; // "not Spanish" = that option is unchecked
+                } else {
+                    // >, <, >=, <= against one checkbox option is meaningless.
+                    // Leave the filter untouched rather than invent a reading.
+                    continue;
+                }
+                $expanded = "[{$field}({$code})] = \"{$checked}\"";
+                $to       = "{$field}({$code}) = \"{$checked}\"";
+            } else {
+                // Non-checkbox: OR the code with the original literal so both
+                // the code path and the label path match.
+                if ($literalIsCode) continue; // already a code — no-op
+                $expanded = "([{$field}] {$op} \"{$code}\" or [{$field}] {$op} {$raw})";
+                $to = "({$field} {$op} \"{$code}\" or {$field} {$op} \"{$literal}\")";
+            }
 
             $filter = substr($filter, 0, $offset) . $expanded . substr($filter, $offset + $length);
             $translations[] = [
                 'field' => $field,
                 'op'    => $op,
                 'from'  => $literal,
-                'to'    => "({$field} {$op} \"{$code}\" or {$field} {$op} \"{$literal}\")",
+                'to'    => $to,
             ];
         }
 

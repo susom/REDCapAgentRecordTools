@@ -15,6 +15,29 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
     // records.aggregate for "across the whole dataset" questions.
     const MAX_RECORDS_RETURNED = 500;
 
+    // Byte budget for the one big list-or-map payload in a tool response
+    // (getMetadata's 'fields', records.get's 'values').
+    //
+    // WHY WE SELF-LIMIT: SecureChatAI caps each tool result and its object
+    // branch drops an oversized key WHOLESALE rather than shortening it — so an
+    // unscoped getMetadata on any real project used to return the field COUNT
+    // and nothing else. Trimming here instead means the caller gets a labelled
+    // partial payload plus an accurate count of what was cut.
+    //
+    // COUPLED TO SecureChatAI's `agent_max_tool_result_chars` (default 8000).
+    // This must stay comfortably below it: the difference covers our wrapper
+    // keys and the ~700-char explanatory note. If that setting is raised (16k,
+    // 24k) this can rise with it to return more per call; if it is lowered
+    // below ~7000 this MUST come down too, or the outer cap starts nuking
+    // payloads wholesale again — the exact failure this constant exists to
+    // prevent. Not read directly: that would couple this EM to SecureChatAI's
+    // settings, which the repo guardrails forbid without explicit instruction.
+    const CAPPY_PAYLOAD_BUDGET = 6000;
+
+    // Field labels can hold entire HTML blocks (descriptive fields). Capped in
+    // the slim view only; a scoped call returns labels in full.
+    const CAPPY_METADATA_LABEL_MAX = 120;
+
     public function __construct()
     {
         parent::__construct();
@@ -143,6 +166,9 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
 
         $pid = (int)$payload['pid'];
         $fields = $payload['fields'] ?? null; // Optional: specific fields only
+        // Did the caller name the fields it wants? That's the path that can
+        // afford the full per-field shape (choices, validation, branching).
+        $scoped = is_array($fields) && !empty($fields);
 
         try {
             // Get full data dictionary
@@ -155,25 +181,63 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 ];
             }
 
-            // Convert to array of field objects for easier agent consumption
+            // Convert to array of field objects for easier agent consumption.
+            // Unscoped calls get a SLIM shape: on a 189-field project the full
+            // shape is ~55KB and the slim one is still ~36KB, so neither fits
+            // the tool-result cap — but the slim rows at least degrade to a
+            // useful partial list instead of being dropped en masse.
             $fields_array = [];
             foreach ($metadata as $field_name => $field_info) {
-                $fields_array[] = [
-                    'field_name' => $field_name,
-                    'form_name' => $field_info['form_name'] ?? null,
-                    'field_type' => $field_info['field_type'] ?? null,
-                    'field_label' => $field_info['field_label'] ?? null,
-                    'select_choices_or_calculations' => $field_info['select_choices_or_calculations'] ?? null,
-                    'required_field' => $field_info['required_field'] ?? null,
-                    'text_validation_type_or_show_slider_number' => $field_info['text_validation_type_or_show_slider_number'] ?? null,
-                    'branching_logic' => $field_info['branching_logic'] ?? null,
+                $row = [
+                    'field_name'  => $field_name,
+                    'form_name'   => $field_info['form_name'] ?? null,
+                    'field_type'  => $field_info['field_type'] ?? null,
+                    'field_label' => $scoped
+                        ? ($field_info['field_label'] ?? null)
+                        : $this->cappyTruncate((string)($field_info['field_label'] ?? ''), self::CAPPY_METADATA_LABEL_MAX),
                 ];
+                if ($scoped) {
+                    $row['select_choices_or_calculations'] = $field_info['select_choices_or_calculations'] ?? null;
+                    $row['required_field'] = $field_info['required_field'] ?? null;
+                    $row['text_validation_type_or_show_slider_number'] = $field_info['text_validation_type_or_show_slider_number'] ?? null;
+                    $row['branching_logic'] = $field_info['branching_logic'] ?? null;
+                }
+                $fields_array[] = $row;
             }
 
+            $total = count($fields_array);
+            [$kept, $dropped] = $this->cappyFitRows($fields_array, self::CAPPY_PAYLOAD_BUDGET);
+
+            // Build the note from what actually happened, so it never claims a
+            // truncation that didn't occur or stays silent about one that did.
+            $note = [];
+            if (!$scoped) {
+                $note[] = "SLIM VIEW: choices, validation and branching logic are omitted. "
+                    . "To get the answer choices for a coded field (needed to turn a stored "
+                    . "code into a label), call this tool again with fields=[\"field_a\",\"field_b\"] "
+                    . "— a scoped call returns the full definition and fits comfortably.";
+            }
+            if ($dropped > 0) {
+                $note[] = "Returned " . count($kept) . " of $total fields; $dropped omitted to fit the "
+                    . "token budget. This is NOT the whole dictionary — do not conclude a field is "
+                    . "absent from the project because it is missing here. Request specific fields by "
+                    . "name via the 'fields' parameter instead of re-requesting everything.";
+            }
+            if ($scoped) {
+                $note[] = "Coded fields: 'select_choices_or_calculations' holds the "
+                    . "code,label pairs. Note that records.get already returns values with "
+                    . "labels resolved, so you rarely need to map codes by hand.";
+            }
+
+            // Key order matters: SecureChatAI's cap drops trailing keys, so the
+            // counts and note must precede the (much larger) field list.
             return [
                 "pid" => $pid,
-                "field_count" => count($fields_array),
-                "fields" => $fields_array
+                "field_count" => $total,
+                "returned_field_count" => count($kept),
+                "view" => $scoped ? "full" : "slim",
+                "note" => implode(' ', $note),
+                "fields" => $kept,
             ];
         } catch (\Exception $e) {
             $this->emError("getMetadata error for pid $pid: " . $e->getMessage());
@@ -236,7 +300,22 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
 
     /**
      * Tool 5: records.get
-     * Get specific record data by record ID
+     * Get specific record data by record ID.
+     *
+     * Returns 'values': the record with every coded field ALREADY RESOLVED to
+     * its choice label, and empty fields omitted. Raw getData output is
+     * withheld unless include_raw=true.
+     *
+     * Why the labeled view is the default (and the raw one is not):
+     * getData('array') returns codes, and for checkbox fields it returns one
+     * key per option whether checked or not. On PID 70, record 1 came back as
+     * ~21KB — over SecureChatAI's 8000-char tool-result cap, whose object
+     * branch drops an oversized key WHOLESALE, so 'data' vanished and the model
+     * got nothing at all. When it narrowed to fields=['d_spoken_language'] it
+     * received 141 keys of `code => '0'|'1'` and knew code 5 was checked but
+     * not that 5 means "Mixteco Bajo" — so it asked the USER for the mapping.
+     * Resolving server-side kills that round-trip and shrinks the payload at
+     * the same time: 141 mostly-zero keys collapse into one string of labels.
      */
     public function toolGetRecord(array $payload)
     {
@@ -258,6 +337,7 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
         $record_id = $payload['record_id'];
         $fields = $payload['fields'] ?? null; // Optional
         $events = $payload['events'] ?? null; // Optional (for longitudinal)
+        $includeRaw = !empty($payload['include_raw']);
 
         try {
             $data = \REDCap::getData($pid, 'array', [$record_id], $fields, $events);
@@ -269,11 +349,142 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 ];
             }
 
-            return [
+            // Walk getData's nested shape ourselves rather than reusing
+            // cappyFlattenRows(): that helper discards event and instance
+            // identity, which is fine for a preview table but would leave the
+            // model unable to say WHICH visit or instance a value came from on
+            // a longitudinal or repeating project — trading the code/label
+            // round-trip we're fixing for a "which visit did you mean?" one.
+            $eventNames = [];
+            $longitudinal = false;
+            try {
+                $projObj = new \Project($pid);
+                $longitudinal = !empty($projObj->longitudinal);
+                if ($longitudinal) $eventNames = $projObj->getUniqueEventNames();
+            } catch (\Exception $e) {
+                // Best effort: fall back to bare event ids below.
+            }
+
+            $rawRows = [];
+            foreach ($data as $events) {
+                if (!is_array($events)) continue;
+                foreach ($events as $eventId => $eventData) {
+                    if ($eventId === 'repeat_instances' || !is_array($eventData)) continue;
+                    $rawRows[] = [
+                        $this->cappyRowContext($longitudinal, $eventNames, $eventId, null, null),
+                        $eventData,
+                    ];
+                }
+                if (isset($events['repeat_instances']) && is_array($events['repeat_instances'])) {
+                    foreach ($events['repeat_instances'] as $eventId => $instruments) {
+                        if (!is_array($instruments)) continue;
+                        foreach ($instruments as $instrument => $instances) {
+                            if (!is_array($instances)) continue;
+                            foreach ($instances as $instance => $rowFields) {
+                                if (!is_array($rowFields)) continue;
+                                $rawRows[] = [
+                                    $this->cappyRowContext($longitudinal, $eventNames, $eventId, $instrument, $instance),
+                                    $rowFields,
+                                ];
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Resolve labels for the fields actually present, not the whole
+            // dictionary — a scoped getDataDictionary call is much cheaper on
+            // wide projects.
+            $present = [];
+            foreach ($rawRows as [, $rowFields]) {
+                foreach (array_keys($rowFields) as $f) $present[$f] = true;
+            }
+            $choiceMaps = $this->cappyChoiceMaps($pid, array_keys($present));
+
+            $emptyOmitted = 0;
+            $built = [];
+            foreach ($rawRows as [$ctx, $rowFields]) {
+                $out = [];
+                foreach ($rowFields as $field => $val) {
+                    $resolved = $this->cappyLabelValue($choiceMaps[$field] ?? [], $val);
+                    // Blank fields are the bulk of a wide record and are almost
+                    // never the question. Omitted, but COUNTED — see the note.
+                    if ($resolved === '') { $emptyOmitted++; continue; }
+                    $out[$field] = $resolved;
+                }
+                $built[] = ['ctx' => $ctx, 'fields' => $out];
+            }
+
+            // Drop rows that came back entirely empty, but never return zero
+            // rows for a record that exists — keep one so the caller can tell
+            // "record found, all blank" from "record not found".
+            $withData = array_values(array_filter($built, fn($b) => !empty($b['fields'])));
+            $use = !empty($withData) ? $withData : array_slice($built, 0, 1);
+
+            // Trim to fit rather than letting the outer cap drop 'values'
+            // entirely. Without this a wide record (PID 70 record 1 is ~14KB
+            // even after label collapsing) loses the whole payload, and the
+            // model then receives BOTH our note saying "call again with
+            // fields=[...]" and SecureChatAI's generic "do not retry" — a
+            // direct contradiction on the one path that most needs to be clear.
+            [$use, $sizeOmitted] = $this->cappyFitRecordRows($use, self::CAPPY_PAYLOAD_BUDGET);
+
+            // Shape decision, made ONCE for the whole response so every row
+            // looks the same. A record with one plain event row plus three
+            // repeating instances would otherwise mix a flat field map (row 0,
+            // which has no context keys) with wrapped rows — the kind of
+            // heterogeneous list that invites the model to misread it.
+            // getData returned something we couldn't walk into rows at all.
+            // Guarded explicitly: $use[0] below would throw on an empty list.
+            $useWrapper = count($use) > 1 || !empty($use[0]['ctx']);
+            if (empty($use)) {
+                $values = [];
+            } elseif ($useWrapper) {
+                $values = array_map(fn($b) => $b['ctx'] + ['fields' => $b['fields']], $use);
+            } else {
+                // The common classic-project case (a single non-repeating row)
+                // collapses to a flat field => value map so the model doesn't
+                // have to reach through a pointless wrapper.
+                $values = $use[0]['fields'];
+            }
+
+            // Key order matters: SecureChatAI's cap drops trailing keys, so the
+            // note (which tells the model how to recover) must land BEFORE the
+            // payload that might not fit, and raw data goes last.
+            $response = [
                 "pid" => $pid,
                 "record_id" => $record_id,
-                "data" => $data
+                "row_count" => count($use),
+                "empty_fields_omitted" => $emptyOmitted,
+                "fields_omitted_for_size" => $sizeOmitted,
+                "note" => "'values' holds this record with all coded fields ALREADY "
+                    . "RESOLVED to their choice labels (checkbox fields list the checked "
+                    . "labels, comma-joined). Report those labels to the user as-is — do "
+                    . "NOT translate codes yourself and NEVER ask the user for a code-to-label "
+                    . "mapping; it is already applied here. Empty fields are omitted. "
+                    . ($useWrapper
+                        ? "This record has multiple rows (longitudinal events and/or repeating "
+                            . "instrument instances), so 'values' is a LIST: each entry has its "
+                            . "field values under 'fields', plus 'event'/'instrument'/'instance' "
+                            . "identifying where those values live. A row with no 'instrument' is "
+                            . "the non-repeating data for that event. "
+                        : "'values' is a flat field => value map. ")
+                    . ($sizeOmitted > 0
+                        ? "NOT ALL FIELDS ARE HERE: $sizeOmitted more had values but were cut to "
+                            . "fit the token budget (fields come in form order, so the tail is "
+                            . "missing). If what you need isn't above, call again with "
+                            . "fields=[...] naming it — that returns it reliably. Do not tell the "
+                            . "user a field is empty just because it is absent here. "
+                        : "")
+                    . "Pass include_raw=true only when you need underlying codes for "
+                    . "computation."
+                    . ($includeRaw ? "" : " Raw getData output withheld by default."),
+                "values" => $values,
             ];
+            if ($includeRaw) {
+                $response["data"] = $data;
+            }
+            return $response;
         } catch (\Exception $e) {
             $this->emError("getRecord error for pid $pid, record $record_id: " . $e->getMessage());
             return [
@@ -1148,24 +1359,164 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
         // Fetch metadata for the chosen columns so coded fields render as
         // LABELS ("Female") instead of raw codes ("2") — otherwise the LLM
         // does its own code→label translation and gets it wrong.
-        //
-        // REDCap's parseEnum() only splits on "\n" (legacy separator); modern
-        // deployments store enums with "|" separators, which makes parseEnum
-        // treat the whole string as one option. We parse both formats here.
-        $meta = [];
+        $meta = $this->cappyChoiceMaps($pid, $cols);
+
+        // Per-cell length cap — keeps the markdown table from collapsing into a
+        // wall of text when a textarea field holds 1000+ chars. Capped AFTER
+        // label resolution so "Mild/Moderate/Severe" enum labels (which are
+        // short) never get truncated; raw long values get cut with a
+        // single-character ellipsis. Full value is still available
+        // via include_records=true for users who need it.
+        $maxCellLen = 120;
+        $esc = function ($v) use ($maxCellLen) {
+            $escaped = str_replace(["|", "\n", "\r"], ['\|', ' ', ' '], trim((string)$v));
+            return $this->cappyTruncate($escaped, $maxCellLen);
+        };
+        $label = function ($field, $val) use ($meta, $esc) {
+            return $esc($this->cappyLabelValue($meta[$field] ?? [], $val));
+        };
+        $out = '| ' . implode(' | ', $cols) . " |\n";
+        $out .= '| ' . implode(' | ', array_fill(0, count($cols), '---')) . " |\n";
+        foreach (array_slice($rows, 0, $maxRows) as [$rid, $fields]) {
+            $cells = [];
+            foreach ($cols as $c) {
+                $cells[] = $c === $recordIdField ? $esc($rid) : $label($c, $fields[$c] ?? '');
+            }
+            $out .= '| ' . implode(' | ', $cells) . " |\n";
+        }
+        return $out;
+    }
+
+    /**
+     * Identity keys for one records.get row: which event it belongs to and,
+     * for repeating data, which instrument and instance.
+     *
+     * Deliberately sparse — a classic non-repeating project gets an empty
+     * array, so the common case stays a flat field => value map with no
+     * wrapper. Event name is only included for longitudinal projects, where
+     * it's the difference between an answer and a follow-up question.
+     */
+    private function cappyRowContext(bool $longitudinal, array $eventNames, $eventId, $instrument, $instance): array
+    {
+        $ctx = [];
+        if ($longitudinal) {
+            $ctx['event'] = $eventNames[$eventId] ?? (string)$eventId;
+        }
+        // Repeating EVENTS come through with an empty instrument key.
+        if ($instrument !== null && $instrument !== '') {
+            $ctx['instrument'] = (string)$instrument;
+        }
+        if ($instance !== null) {
+            $ctx['instance'] = (int)$instance;
+        }
+        return $ctx;
+    }
+
+    /**
+     * Trim a string to $max characters with a single-character ellipsis.
+     */
+    private function cappyTruncate(string $s, int $max): string
+    {
+        if (mb_strlen($s) <= $max) return $s;
+        return mb_substr($s, 0, $max - 1) . '…';
+    }
+
+    /**
+     * Trim labelled records.get rows to fit $budget bytes of JSON, dropping
+     * trailing FIELDS (then trailing rows) so 'values' always survives the
+     * outer tool-result cap instead of being dropped wholesale.
+     *
+     * Fields arrive in data-dictionary order, so what gets cut is the tail of
+     * the form sequence — deterministic, and the caller reports the count so
+     * the omission is never silent.
+     *
+     * Returns [rows, omitted_field_count].
+     */
+    private function cappyFitRecordRows(array $built, int $budget): array
+    {
+        $size = 2; // [] brackets
+        $out = [];
+        $omitted = 0;
+        $exhausted = false;
+        foreach ($built as $b) {
+            if ($exhausted) {
+                $omitted += count($b['fields']);
+                continue;
+            }
+            $size += strlen(json_encode($b['ctx'], JSON_UNESCAPED_UNICODE)) + 16; // ctx + "fields":{}
+            $kept = [];
+            foreach ($b['fields'] as $f => $v) {
+                $fsz = strlen($f) + strlen(json_encode($v, JSON_UNESCAPED_UNICODE)) + 4;
+                if ($size + $fsz > $budget) {
+                    $exhausted = true;
+                    $omitted++;
+                    continue;
+                }
+                $kept[$f] = $v;
+                $size += $fsz;
+            }
+            if (!empty($kept)) {
+                $out[] = ['ctx' => $b['ctx'], 'fields' => $kept];
+            }
+        }
+        return [$out, $omitted];
+    }
+
+    /**
+     * Keep as many leading rows as fit within $budget bytes of JSON.
+     *
+     * Deliberately self-limiting: SecureChatAI's cap would otherwise drop the
+     * entire list-valued key, leaving the model with a response that has no
+     * data and no indication of how much it was missing. Returns
+     * [kept_rows, dropped_count] so the caller can say exactly what it cut.
+     */
+    private function cappyFitRows(array $rows, int $budget): array
+    {
+        $size = 2; // [] brackets
+        $kept = [];
+        foreach ($rows as $row) {
+            $size += strlen(json_encode($row, JSON_UNESCAPED_UNICODE)) + 1; // +1 comma
+            if ($size > $budget) break;
+            $kept[] = $row;
+        }
+        return [$kept, count($rows) - count($kept)];
+    }
+
+    /**
+     * Build `field_name => [code => label]` maps for every coded field in
+     * $fields (or the whole project when $fields is null).
+     *
+     * This is the single source of truth for code→label resolution. Every tool
+     * that hands values back to the model MUST route them through here rather
+     * than shipping raw codes: an LLM shown `d_legal_sex = 0` guesses "Female"
+     * about as often as "Male", and when the field is a 141-option checkbox
+     * like d_spoken_language it cannot even guess — it asks the user for the
+     * mapping, which is both a terrible experience and information the tool
+     * already had.
+     *
+     * REDCap's parseEnum() only splits on "\n" (legacy separator); modern
+     * deployments store enums with "|" separators, which makes parseEnum treat
+     * the whole string as one option. We parse both formats here.
+     *
+     * Labels are best-effort by design — on any dictionary failure this returns
+     * [] and callers fall back to raw values rather than erroring out.
+     */
+    private function cappyChoiceMaps(int $pid, ?array $fields = null): array
+    {
+        $maps = [];
         try {
-            $dd = \REDCap::getDataDictionary($pid, 'array', false, $cols);
+            $dd = \REDCap::getDataDictionary($pid, 'array', false, $fields);
             foreach ($dd as $fname => $info) {
                 $type = $info['field_type'] ?? '';
                 if (!in_array($type, ['radio', 'select', 'dropdown', 'checkbox', 'yesno', 'truefalse'], true)) {
                     continue;
                 }
                 if ($type === 'yesno') {
-                    $meta[$fname] = ['1' => 'Yes', '0' => 'No'];
+                    $maps[$fname] = ['1' => 'Yes', '0' => 'No'];
                     continue;
                 }
                 if ($type === 'truefalse') {
-                    $meta[$fname] = ['1' => 'True', '0' => 'False'];
+                    $maps[$fname] = ['1' => 'True', '0' => 'False'];
                     continue;
                 }
                 $enum = (string)($info['select_choices_or_calculations'] ?? '');
@@ -1181,55 +1532,39 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                     if ($code === '' || $label === '') continue;
                     $pairs[$code] = $label;
                 }
-                $meta[$fname] = $pairs;
+                $maps[$fname] = $pairs;
             }
         } catch (\Exception $e) {
-            $meta = []; // labels are best-effort; raw values on failure
+            return []; // labels are best-effort; callers fall back to raw values
         }
+        return $maps;
+    }
 
-        // Per-cell length cap — keeps the markdown table from collapsing into a
-        // wall of text when a textarea field holds 1000+ chars. Capped AFTER
-        // label resolution so "Mild/Moderate/Severe" enum labels (which are
-        // short) never get truncated; raw long values get cut at $maxCellLen
-        // with a single-character ellipsis. Full value is still available
-        // via include_records=true for users who need it.
-        $maxCellLen = 120;
-        $truncate = function (string $s) use ($maxCellLen): string {
-            if (mb_strlen($s) <= $maxCellLen) return $s;
-            return mb_substr($s, 0, $maxCellLen - 1) . '…';
-        };
-        $esc = function ($v) use ($truncate) {
-            $escaped = str_replace(["|", "\n", "\r"], ['\|', ' ', ' '], trim((string)$v));
-            return $truncate($escaped);
-        };
-        $label = function ($field, $val) use ($meta, $esc) {
-            // Checkbox values arrive as arrays of code => '0'/'1' — render the checked labels
-            if (is_array($val)) {
-                $checked = [];
-                foreach ($val as $code => $flag) {
-                    if ((string)$flag !== '' && (string)$flag !== '0') {
-                        $checked[] = $meta[$field][$code] ?? $code;
-                    }
+    /**
+     * Resolve one stored value to its human label using a choice map from
+     * cappyChoiceMaps(). Pass an empty map for uncoded fields — the value
+     * comes back untouched, so callers can run every field through this
+     * without checking types first.
+     *
+     * Checkbox values arrive from getData('array') as `{code => '0'|'1'}` for
+     * EVERY option, checked or not (141 keys for d_spoken_language). This
+     * collapses them to the comma-joined CHECKED labels, which is both the
+     * correct rendering and a large size win — most of those keys are zeros.
+     */
+    private function cappyLabelValue(array $choiceMap, $val): string
+    {
+        if (is_array($val)) {
+            $checked = [];
+            foreach ($val as $code => $flag) {
+                if ((string)$flag !== '' && (string)$flag !== '0') {
+                    $checked[] = $choiceMap[$code] ?? $code;
                 }
-                return $esc(implode(', ', $checked));
             }
-            $val = trim((string)$val);
-            if ($val === '') return '';
-            if (isset($meta[$field]) && array_key_exists($val, $meta[$field])) {
-                return $esc($meta[$field][$val]);
-            }
-            return $esc($val);
-        };
-        $out = '| ' . implode(' | ', $cols) . " |\n";
-        $out .= '| ' . implode(' | ', array_fill(0, count($cols), '---')) . " |\n";
-        foreach (array_slice($rows, 0, $maxRows) as [$rid, $fields]) {
-            $cells = [];
-            foreach ($cols as $c) {
-                $cells[] = $c === $recordIdField ? $esc($rid) : $label($c, $fields[$c] ?? '');
-            }
-            $out .= '| ' . implode(' | ', $cells) . " |\n";
+            return implode(', ', $checked);
         }
-        return $out;
+        $val = trim((string)$val);
+        if ($val === '') return '';
+        return array_key_exists($val, $choiceMap) ? $choiceMap[$val] : $val;
     }
 
     /**

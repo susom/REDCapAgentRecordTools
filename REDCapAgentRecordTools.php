@@ -530,6 +530,43 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             $filterHints = $expanded['hints'] ?? [];
         }
         $fields = $payload['fields'] ?? null; // Optional
+        // DISPLAY columns only — deliberately separate from 'fields'.
+        // 'fields' narrows what gets FETCHED and therefore what lands in the
+        // session cache, so narrowing it breaks in-memory follow-up filtering
+        // (reference + new filter). 'columns' leaves the cache full-width and
+        // only steers which columns preview_markdown shows.
+        $columns = $payload['columns'] ?? null;
+        // Models sometimes send a bare string for a single column, or a
+        // comma-joined string. Accept both rather than dropping the request.
+        if (is_string($columns)) {
+            $columns = array_filter(array_map('trim', explode(',', $columns)), 'strlen');
+        }
+        if (is_array($columns)) {
+            $columns = array_values(array_filter(array_map('strval', $columns), 'strlen'));
+        }
+        // An explicitly EMPTY columns list means "go back to auto-picked
+        // columns". Without this there is no way to undo a previous choice,
+        // because a cached set inherits its columns (see the reference and
+        // append paths below) and an omitted param means "inherit".
+        $columnsReset = array_key_exists('columns', $payload) && is_array($columns) && empty($columns);
+        if (!is_array($columns) || empty($columns)) $columns = null;
+
+        // Same treatment the filter gets: a typo'd column name is reported with
+        // ranked suggestions so the model can retry, instead of yielding a table
+        // that quietly lacks the column the user asked for.
+        if ($columns !== null) {
+            $colError = $this->cappyValidateFieldNames($pid, $columns, 'columns');
+            if ($colError !== null) return $colError;
+        }
+
+        // 'columns' is display-only, but it can only display what was FETCHED.
+        // When the caller also scoped 'fields', a requested column outside that
+        // scope would be absent from the rows and silently dropped from the
+        // table — so widen the fetch to cover it. Harmless when 'fields' is
+        // omitted, since that already fetches everything.
+        if ($columns !== null && is_array($fields) && !empty($fields)) {
+            $fields = array_values(array_unique(array_merge($fields, $columns)));
+        }
         $return_format = $payload['return_format'] ?? 'array'; // 'array' or 'json'
         $offset = max(0, (int)($payload['offset'] ?? 0));
         // No upper clamp — caller may request as many as they want (default
@@ -588,6 +625,11 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                     "message" => "append_to reference $appendTo was cached for a different project."
                 ];
             }
+            // Same reasoning as the reference path: "also severity 4" should not
+            // silently reshape the table the user is already looking at.
+            if ($columns === null && !$columnsReset && !empty($appendBase['columns']) && is_array($appendBase['columns'])) {
+                $columns = $appendBase['columns'];
+            }
         }
 
         // Reference path: reuse the PHP session cache instead of re-querying.
@@ -617,6 +659,17 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             $newFilter = trim((string)($filter ?? ''));
             $filteredFromCache = false;
 
+            // Inherit the display columns chosen when this set was first built,
+            // unless this call names its own. Without this, paging silently
+            // changes the table's shape: the UI's prev/next handler
+            // (REDCapChatBot::cappyPage) calls records_search with only
+            // reference/offset/limit, so page 2 would fall back to the
+            // auto-ranked columns and re-introduce the very name/DOB/MRN
+            // columns page 1 was asked to leave out.
+            if ($columns === null && !$columnsReset && !empty($cached['columns']) && is_array($cached['columns'])) {
+                $columns = $cached['columns'];
+            }
+
             // Mode 2: new filter → narrow the cached recordset in memory
             if ($newFilter !== '' && $newFilter !== $cachedFilter) {
                 $data = $this->cappyFilterCachedRecords($pid, $data, $newFilter);
@@ -626,6 +679,7 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                     'pid' => $pid,
                     'filter' => $newFilter,
                     'ids' => $data,
+                    'columns' => $columns,
                 ]);
             }
 
@@ -648,7 +702,7 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 "offset" => $offset,
                 "limit" => $limit,
                 "truncated" => ($offset + $returned_count) < $total,
-                "preview_markdown" => $this->cappyBuildPreview($pid, $page, $activeFilter),
+                "preview_markdown" => $this->cappyBuildPreview($pid, $page, $activeFilter, 20, 8, $columns),
                 "note" => ($filteredFromCache
                     ? "Filtered from the cached recordset in memory (no database re-query). Subset cached as $reference — pass it back with a new filter to narrow further, or with offset/limit to page. "
                     : "Served from session cache (reference $reference). ")
@@ -702,6 +756,8 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                     ? "(" . ($mergedFrom['base_filter'] ?? '') . ") OR (" . ($filter ?? '') . ")"
                     : $filter,
                 'ids' => $data,
+                // Remembered so prev/next page turns keep the same columns.
+                'columns' => $columns,
             ]);
 
             $page = is_array($data) ? array_slice($data, $offset, $limit, true) : [];
@@ -725,7 +781,7 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 "offset" => $offset,
                 "limit" => $limit,
                 "truncated" => $truncated,
-                "preview_markdown" => $this->cappyBuildPreview($pid, $page, $filter),
+                "preview_markdown" => $this->cappyBuildPreview($pid, $page, $filter, 20, 8, $columns),
                 "note" => ($mergedFrom
                     ? "APPENDED to the cached working set: {$mergedFrom['new_count']} records matched the new filter, {$mergedFrom['added_count']} were new — merged set is now $total_record_count records (was {$mergedFrom['base_count']}), cached as \"$ref\". The accumulated set is what the user now means by 'the records' — narrow it with reference + new filter, or append more with append_to + new filter. "
                     : "")
@@ -860,7 +916,21 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
         if ($limit <= 0 || $limit > 200) $limit = 50;
         $reference = $payload['reference'] ?? null;
 
-        // Reference path: serve from PHP session cache
+        // Reference path: serve from PHP session cache.
+        //
+        // Unlike records.search, this path cannot narrow: it slices stored IDs
+        // and has no row data to re-evaluate logic against. Silently ignoring
+        // the filter while echoing it back in the response produced a
+        // confidently wrong answer (the whole cached list, labelled with a
+        // filter that was never applied), so refuse the combination and point
+        // the caller at the tool that can do it.
+        if ($reference && !empty($filter)) {
+            return [
+                "error" => true,
+                "message" => "records.listIds cannot apply a filter to a cached reference — paging a reference only slices the stored IDs. "
+                    . "Either call records.listIds with the filter and NO reference to run it fresh, or use records.search with reference + filter to narrow an existing set."
+            ];
+        }
         if ($reference) {
             $cached = $this->cappyCacheFetch($reference, 'records_listIds');
             if ($cached === null) {
@@ -890,6 +960,30 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 "truncated" => ($offset + count($slice)) < count($ids),
                 "note" => "Served from session cache (reference $reference).",
             ];
+        }
+
+        // Validate + expand the filter exactly as toolSearchRecords,
+        // toolCountRecords and toolAggregateRecords do. This tool used to pass
+        // the raw filter straight to getData, so a label literal
+        // ([unit] = "CVICU 220") was compared against the stored CODE and
+        // matched nothing — reported to the user as a confident "no records
+        // match" rather than an error. A typo'd field name failed the same
+        // silent way.
+        //
+        // Deliberately AFTER the reference path: paging a cached list slices
+        // stored ids and never applies $filter, so validating/expanding there
+        // would spend two data-dictionary lookups per page turn for nothing.
+        if (!empty($filter)) {
+            $fieldError = $this->cappyValidateFilterFields($pid, $filter);
+            if ($fieldError !== null) return $fieldError;
+        }
+        $filterExpansions = [];
+        $filterHints = [];
+        if (!empty($filter)) {
+            $expanded = $this->cappyExpandFilterLabels($pid, $filter);
+            $filter = $expanded['filter'];
+            $filterExpansions = $expanded['translations'];
+            $filterHints = $expanded['hints'] ?? [];
         }
 
         try {
@@ -922,6 +1016,8 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
                 return [
                     "pid" => $pid,
                     "filter" => $filter,
+                    "filter_translations" => $filterExpansions,
+                    "value_not_on_this_field" => $filterHints,
                     "reference" => $ref,
                     "count" => count($ids),
                     "returned_count" => 0,
@@ -940,6 +1036,10 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             return [
                 "pid"             => $pid,
                 "filter"          => $filter,
+                "filter_translations" => $filterExpansions,
+                // Turns a true-but-useless 0 into a legible wrong-field hint,
+                // same as records.search and records.count.
+                "value_not_on_this_field" => $filterHints,
                 "count"           => count($ids),
                 "returned_count"  => count($slice),
                 "offset"          => $offset,
@@ -1197,7 +1297,20 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
      */
     private function cappyValidateFilterFields(int $pid, string $filter): ?array
     {
-        $referenced = $this->cappyExtractFilterFields($filter);
+        return $this->cappyValidateFieldNames($pid, $this->cappyExtractFilterFields($filter), 'filter');
+    }
+
+    /**
+     * Validate field names against the data dictionary and, on a miss, return a
+     * hard error carrying ranked best-guess replacements.
+     *
+     * $context names the parameter for the error message ('filter', 'columns').
+     * Shared by both so a typo'd display column fails the same visible way a
+     * typo'd filter field does — silently dropping it renders a table missing
+     * the column the user asked for while the model narrates as if it were there.
+     */
+    private function cappyValidateFieldNames(int $pid, array $referenced, string $context): ?array
+    {
         if (empty($referenced)) return null;
 
         try {
@@ -1256,10 +1369,14 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             $summary[] = "{$bad} -> {$info['best_match']} (label: \"{$info['best_label']}\")";
         }
 
+        $consequence = $context === 'filter'
+            ? "the filter would silently match 0 records"
+            : "those columns would be silently missing from the table";
+
         return [
             "error" => true,
-            "message" => "Unknown field(s) in filter: " . implode(', ', $unknown)
-                . ". These fields do not exist in project $pid — the filter would silently match 0 records. "
+            "message" => "Unknown field(s) in $context: " . implode(', ', $unknown)
+                . ". These fields do not exist in project $pid — $consequence. "
                 . "Best guesses: " . implode('; ', $summary)
                 . ". Use best_match unless its label clearly doesn't match the user's intent.",
             "unknown_fields" => $unknown,
@@ -1311,54 +1428,60 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
     }
 
     /**
-     * Build a ready-to-render markdown preview table from a page of getData
-     * rows. The LLM is instructed to echo this verbatim — eliminates the
-     * "would you like to see the records?" dance when records are wide.
+     * Choose the preview's columns. Pure: takes flattened rows and returns the
+     * ordered column list, no REDCap or DB access, so it is unit-testable.
      *
-     * Rows: one per record instance (repeating instruments flattened).
-     * Columns: record_id + fields referenced in the filter + the fields with
-     * the most non-empty values in the sample (checkbox arrays and form
-     * status fields excluded), capped at $maxCols. Rows capped at $maxRows.
+     * Precedence, highest first:
+     *   1. the record ID field, always
+     *   2. $requestedCols — columns the caller explicitly asked to see
+     *   3. fields referenced in the filter, which show WHY rows matched
+     *   4. remaining fields ranked by how often they carry a value
      *
-     * Checkbox fields: REDCap returns these as array values
-     * (`{code => '0'|'1', ...}` per option). The preview renders each row's
-     * checked options as a comma-joined list of labels — so users see e.g.
-     * "Blister, Bruised, Redness" instead of an opaque array.
+     * Step 4 is SKIPPED entirely when $requestedCols is non-null. "Show unit
+     * and severity" means those columns, not those plus four guesses; padding an
+     * explicit request out to $maxCols is how name/DOB/MRN ended up in previews
+     * that never asked for them. Unrecognised or all-empty requested fields are
+     * dropped rather than rendered as blank columns.
      */
-    private function cappyBuildPreview(int $pid, array $page, ?string $filter, int $maxRows = 20, int $maxCols = 8): string
+    private function cappySelectColumns(array $rows, array $checkboxFields, string $recordIdField, array $filterFields, ?array $requestedCols, int $maxCols): array
     {
-        if (empty($page)) return '';
-        $recordIdField = \REDCap::getRecordIdField($pid);
-
-        $rows = $this->cappyFlattenRows($page);
-        if (empty($rows)) return '';
-
-        // Identify checkbox fields: scan rows for any field whose value is an
-        // array (the checkbox shape REDCap returns). Confirm each candidate
-        // against the data dictionary so we don't accidentally promote scalar
-        // fields that happen to be array-typed for some other reason.
-        $checkboxFields = $this->cappyDetectCheckboxFields($pid, $rows);
-
-        // Column selection
         $cols = [$recordIdField];
-        foreach ($this->cappyExtractFilterFields($filter ?? '') as $f) {
-            if ($f === $recordIdField || in_array($f, $cols)) continue;
+
+        // A field can only be a column if it appears in the sampled rows.
+        // Checkbox bases (array values) qualify; other array-typed values do not.
+        //
+        // $requireValue distinguishes the two callers: a REQUESTED column must
+        // prove it carries a value somewhere in the page, so a typo or an
+        // all-empty field is dropped instead of rendered as a blank column. A
+        // FILTER column keeps the original, laxer rule — it is worth showing
+        // even when blank here, because it is the reason these rows matched.
+        $usable = function ($f, bool $requireValue) use ($rows, $checkboxFields) {
             foreach ($rows as [, $fields]) {
                 if (!array_key_exists($f, $fields)) continue;
-                // Allow checkbox bases (array values) and scalar values alike.
-                if (isset($checkboxFields[$f])) { $cols[] = $f; break; }
-                if (!is_array($fields[$f])) { $cols[] = $f; break; }
+                if (isset($checkboxFields[$f])) return true;
+                if (is_array($fields[$f])) continue;
+                if (!$requireValue) return true;
+                if ($fields[$f] !== '' && $fields[$f] !== null) return true;
             }
-        }
-        // Rank remaining fields by non-empty count across the sample.
-        // - Scalar fields: count rows where the value is non-empty.
-        // - Checkbox fields: count rows where any option is checked (truthy).
-        // Both kinds are sorted into one ranking so the most informative columns
-        // win the remaining slots regardless of type.
+            return false;
+        };
+        $addCol = function ($f, bool $requireValue) use (&$cols, $recordIdField, $usable, $maxCols) {
+            $f = (string)$f;
+            if ($f === '' || $f === $recordIdField || in_array($f, $cols, true)) return;
+            if (count($cols) >= $maxCols) return;
+            if (!$usable($f, $requireValue)) return;
+            $cols[] = $f;
+        };
+
+        foreach ($requestedCols ?? [] as $f) $addCol($f, true);
+        foreach ($filterFields as $f) $addCol($f, false);
+
+        if ($requestedCols !== null) return $cols;
+
         $scores = [];
         foreach (array_slice($rows, 0, 50) as [, $fields]) {
             foreach ($fields as $field => $val) {
-                if (in_array($field, $cols)) continue;
+                if (in_array($field, $cols, true)) continue;
                 if (strpos($field, '___') !== false || substr($field, -9) === '_complete') continue;
                 if (!isset($scores[$field])) $scores[$field] = 0;
                 if (isset($checkboxFields[$field])) {
@@ -1374,6 +1497,46 @@ class REDCapAgentRecordTools extends \ExternalModules\AbstractExternalModule {
             if ($n === 0) break; // never add all-empty columns
             $cols[] = $field;
         }
+        return $cols;
+    }
+
+    /**
+     * Build a ready-to-render markdown preview table from a page of getData
+     * rows. The LLM is instructed to echo this verbatim — eliminates the
+     * "would you like to see the records?" dance when records are wide.
+     *
+     * Rows: one per record instance (repeating instruments flattened), capped
+     * at $maxRows. Columns are chosen by cappySelectColumns() and capped at
+     * $maxCols — see that method for the precedence rules.
+     *
+     * Checkbox fields: REDCap returns these as array values
+     * (`{code => '0'|'1', ...}` per option). The preview renders each row's
+     * checked options as a comma-joined list of labels — so users see e.g.
+     * "Blister, Bruised, Redness" instead of an opaque array.
+     */
+    private function cappyBuildPreview(int $pid, array $page, ?string $filter, int $maxRows = 20, int $maxCols = 8, ?array $requestedCols = null): string
+    {
+        if (empty($page)) return '';
+        $recordIdField = \REDCap::getRecordIdField($pid);
+
+        $rows = $this->cappyFlattenRows($page);
+        if (empty($rows)) return '';
+
+        // Identify checkbox fields: scan rows for any field whose value is an
+        // array (the checkbox shape REDCap returns). Confirm each candidate
+        // against the data dictionary so we don't accidentally promote scalar
+        // fields that happen to be array-typed for some other reason.
+        $checkboxFields = $this->cappyDetectCheckboxFields($pid, $rows);
+
+        // Column selection
+        $cols = $this->cappySelectColumns(
+            $rows,
+            $checkboxFields,
+            $recordIdField,
+            $this->cappyExtractFilterFields($filter ?? ''),
+            $requestedCols,
+            $maxCols
+        );
 
         // Fetch metadata for the chosen columns so coded fields render as
         // LABELS ("Female") instead of raw codes ("2") — otherwise the LLM
